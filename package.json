@@ -1,0 +1,19 @@
+{
+  "name": "xhs-bulk-download",
+  "version": "2.1.0",
+  "description": "批量下载小红书博主个人主页全部笔记图片的命令行工具",
+  "type": "module",
+  "bin": {
+    "xhs-bulk-download": "scripts/bulk-download.mjs"
+  },
+  "scripts": {
+    "start": "node scripts/bulk-download.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "puppeteer-core": ">=22.0.0"
+  },
+  "license": "MIT"
+}
