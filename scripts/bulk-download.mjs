@@ -119,6 +119,18 @@ const log = (...args) => console.log(stamp(), ...args);
 const rand = (a, b) => a + Math.floor(Math.random() * (b - a)); // 反爬节奏：随机区间 [a, b)
 
 async function isLoggedIn(page) {
+  // 多维度检测登录态：INITIAL_STATE 不可靠（首页经常未填充），
+  // 优先用 Cookie 检测（a1 + web_session 同时存在 = 已登录）
+  try {
+    const cookies = await page.cookies();
+    const hasA1 = cookies.some(c => c.name === 'a1');
+    const hasWebSession = cookies.some(c => c.name === 'web_session');
+    const hasXhsId = cookies.some(c => c.name.startsWith('xhs-pc-web.'));
+    if (hasA1 && hasWebSession) { return { loggedIn: true, nickname: 'cookie detected' }; }
+    if (hasXhsId) { return { loggedIn: true, nickname: 'cookie detected' }; }
+  } catch(e) {}
+  
+  // Fallback: INITIAL_STATE
   try {
     return await page.evaluate(() => {
       const user = window.__INITIAL_STATE__?.user?.userInfo;
@@ -130,23 +142,49 @@ async function isLoggedIn(page) {
 async function ensureLogin(page) {
   if (SKIP_LOGIN) { log('Skipping login check (--skip-login)'); return true; }
   
-  await page.goto('https://www.xiaohongshu.com', { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
-  await sleep(2000);
+  // 直接打开个人主页（带 xsec_token），这是最准确的检测方式：
+  // 能提取到 xsec = 页面正常工作 = 无需额外登录
+  log('Checking access via profile page...');
+  await page.goto(PROFILE_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+  await sleep(3000);
   
-  const info = await isLoggedIn(page);
-  if (info.loggedIn) { log(`Logged in: ${info.nickname}`); return true; }
+  // 检测1：URL 是否被重定向到登录页
+  const url = page.url();
+  if (url.includes('/login')) {
+    log('Redirected to login page — need to log in.');
+  } else {
+    // 检测2：能否提取到 xsec token（最直接的"能用"指标）
+    const xsecMap = await extractXsec(page);
+    if (Object.keys(xsecMap).length > 0) {
+      const info = await isLoggedIn(page);
+      log(`Profile accessible (${Object.keys(xsecMap).length} xsec). ${info.nickname ? 'User: ' + info.nickname : ''}`);
+      return true;
+    }
+    log('Profile loaded but 0 xsec tokens — likely guest mode.');
+  }
   
-  log('NOT LOGGED IN — opening login page...');
+  // 需要登录：打开登录页
+  log('Opening login page. SCAN QR CODE in the browser window.');
   await page.goto('https://www.xiaohongshu.com/login', { waitUntil: 'networkidle2' }).catch(() => {});
-  log('SCAN QR CODE in the browser window. Waiting (max 5 min)...');
   
   for (let i = 0; i < 100; i++) {
     await sleep(3000);
     const status = await isLoggedIn(page);
-    if (status.loggedIn) { log(`Logged in: ${status.nickname}`); return true; }
-    if (i === 30) log('Still waiting...');
+    if (status.loggedIn) {
+      log(`Login detected: ${status.nickname}`);
+      // 验证：回到个人主页确认有效
+      await page.goto(PROFILE_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      await sleep(3000);
+      const verifyMap = await extractXsec(page);
+      if (Object.keys(verifyMap).length > 0) {
+        log(`Verified: ${Object.keys(verifyMap).length} xsec available`);
+        return true;
+      }
+      log('Login detected but profile still in guest mode — retrying...');
+    }
+    if (i === 30) log('Still waiting for QR code scan...');
   }
-  log('LOGIN TIMEOUT. Re-run when logged in, or use --skip-login if already logged in.');
+  log('LOGIN TIMEOUT. Please log in manually and re-run.');
   return false;
 }
 
@@ -282,14 +320,17 @@ async function main() {
   try {
     if (!await ensureLogin(page)) { await browser.close(); process.exit(1); }
 
-    log('Opening profile...');
-    await page.goto(PROFILE_URL, { waitUntil: 'networkidle2', timeout: 60000 });
-    await sleep(5000);
-
+    // ensureLogin already navigated to profile page — verify we're in the right place
     if (page.url().includes('error_code=300012')) {
       log('IP BLOCKED! xsec_token may be expired. Get a fresh share link.');
       await browser.close();
       process.exit(1);
+    }
+    if (!page.url().includes('/user/profile/')) {
+      // ensureLogin might have left us on login page if something went wrong
+      log('Not on profile page — navigating...');
+      await page.goto(PROFILE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await sleep(3000);
     }
 
     const xsecMap = await patientScroll(page);
