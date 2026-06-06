@@ -259,9 +259,14 @@ async function main() {
   if (!uidMatch) { log('ERROR: Cannot extract user ID from URL'); process.exit(1); }
   const uid = uidMatch[1];
 
-  // 桌面环境不必关浏览器沙箱；仅在 Linux（常见无沙箱的容器/CI）才加 --no-sandbox
-  const launchArgs = ['--disable-blink-features=AutomationControlled', '--no-first-run'];
-  if (os.platform() === 'linux') { launchArgs.push('--no-sandbox', '--disable-setuid-sandbox'); }
+  // --no-sandbox 是必需的，所有平台无条件保留：实测部分 Windows 环境（含 Git Bash）
+  // 不加它 Chrome 无法启动；原脚本所有笔记也都是带此参数在 Windows 上跑通的。请勿移除。
+  const launchArgs = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-blink-features=AutomationControlled',
+    '--no-first-run',
+  ];
 
   const browser = await puppeteer.launch({
     executablePath: CHROME_PATH,
