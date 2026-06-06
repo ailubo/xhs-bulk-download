@@ -248,11 +248,12 @@ async function downloadNote(page, noteId, xsec, uid, outputDir) {
   await sleep(2000);
   if (page.url().includes('error') || page.url().includes('404')) return 0;
 
-  // 风控检测：撞到验证/频繁提示就停，别硬刚（保护账号）
+  // 风控检测：撞到验证/频繁提示就停（实测 XHS 会显示 "安全验证" / "请勿频繁操作"）
   const blocked = await page.evaluate(() => {
     const t = ((document.body && document.body.innerText) || '').slice(0, 300);
-    if (/验证码|滑动验证|操作过于频繁|访问异常|请完成|拼图/.test(t)) return true;
-    return !!document.querySelector('.captcha, [class*="captcha"], [class*="verify-"], .vc-container');
+    if (/安全验证|请勿频繁操作|操作过于频繁|访问异常|验证码/.test(t)) return true;
+    if (/\/captcha|\/sec_/.test(window.location.href)) return true;
+    return !!document.querySelector('.captcha, [class*="captcha"], [class*="verify-"]');
   });
   if (blocked) return -1;
 
