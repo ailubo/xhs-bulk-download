@@ -140,7 +140,19 @@ async function isLoggedIn(page) {
 }
 
 async function ensureLogin(page) {
-  if (SKIP_LOGIN) { log('Skipping login check (--skip-login)'); return true; }
+  // --skip-login: still verify that profile loads with xsec (guest mode = 0 xsec = effectively not logged in)
+  if (SKIP_LOGIN) {
+    log('--skip-login: verifying profile access...');
+    await page.goto(PROFILE_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+    await sleep(3000);
+    const xsecMap = await extractXsec(page);
+    if (Object.keys(xsecMap).length > 0) {
+      log(`Profile accessible (${Object.keys(xsecMap).length} xsec). Continuing.`);
+      return true;
+    }
+    log('0 xsec — likely guest mode. Try without --skip-login to log in first.');
+    return false;
+  }
   
   // 直接打开个人主页（带 xsec_token），这是最准确的检测方式：
   // 能提取到 xsec = 页面正常工作 = 无需额外登录
@@ -228,10 +240,12 @@ async function downloadNote(page, noteId, xsec, uid, outputDir) {
     ? `https://www.xiaohongshu.com/user/profile/${uid}/${noteId}?xsec_token=${xsec}&xsec_source=pc_user`
     : `https://www.xiaohongshu.com/explore/${noteId}`;
 
-  // domcontentloaded 即可——图片字节后面单独 fetch，不必死等 networkidle2（更快、请求更少）
+  // domcontentloaded 之后等 React 渲染完笔记内容再抓图（networkidle2 太慢，domcontentloaded 太早）
   try { await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 }); } catch(e) { return 0; }
-  await page.waitForSelector('img', { timeout: 8000 }).catch(() => {});
-  await sleep(rand(600, 1200));
+  // 等笔记详情容器出现（比等任意 img 更可靠）
+  await page.waitForSelector('.note-scroller, [class*="note-"], #detail-desc', { timeout: 10000 }).catch(() => {});
+  // 再给 React 一点时间渲染图片
+  await sleep(2000);
   if (page.url().includes('error') || page.url().includes('404')) return 0;
 
   // 风控检测：撞到验证/频繁提示就停，别硬刚（保护账号）
@@ -320,17 +334,11 @@ async function main() {
   try {
     if (!await ensureLogin(page)) { await browser.close(); process.exit(1); }
 
-    // ensureLogin already navigated to profile page — verify we're in the right place
+    // ensureLogin already navigated to profile page and verified xsec
     if (page.url().includes('error_code=300012')) {
       log('IP BLOCKED! xsec_token may be expired. Get a fresh share link.');
       await browser.close();
       process.exit(1);
-    }
-    if (!page.url().includes('/user/profile/')) {
-      // ensureLogin might have left us on login page if something went wrong
-      log('Not on profile page — navigating...');
-      await page.goto(PROFILE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-      await sleep(3000);
     }
 
     const xsecMap = await patientScroll(page);
