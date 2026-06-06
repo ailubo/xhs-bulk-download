@@ -381,12 +381,11 @@ async function main() {
       total += cnt;
       console.log(`  → ${cnt} images (total: ${total})`);
 
-      // 反爬节奏：笔记之间随机停顿，避免等间隔高频翻页
-      await sleep(rand(2000, 5000));
-      // 每 40 篇喝口水，进一步打散节奏
-      if ((i + 1) % 40 === 0 && i + 1 < todo.length) {
-        const restMs = rand(30000, 90000);
-        log(`  已处理 ${i + 1} 篇，分批休息 ${Math.round(restMs / 1000)}s…`);
+      // 反爬节奏：笔记之间 8-15s 随机停顿 + 每 15 篇休息 3-5 分钟
+      await sleep(rand(8000, 15000));
+      if ((i + 1) % 15 === 0 && i + 1 < todo.length) {
+        const restMs = rand(180000, 300000);
+        log(`  🍵 ${i + 1} 篇完成，休息 ${Math.round(restMs / 1000 / 60)} 分钟…`);
         await sleep(restMs);
       }
     }
