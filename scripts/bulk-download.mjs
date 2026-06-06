@@ -1,6 +1,14 @@
 #!/usr/bin/env node
-// XHS Bulk Image Downloader v2 — Generic, portable, single-file
-// Usage: node bulk-download.mjs <profile_url> <output_dir> [--chrome PATH] [--profile DIR] [--skip-login]
+// XHS Bulk Image Downloader v2.1 — Generic, portable, single-file
+// Usage: node bulk-download.mjs <profile_url> <output_dir> [--chrome PATH] [--profile DIR] [--skip-login] [--max-notes N]
+//
+// v2.1 反爬 + 效率改进：
+//   - 下载阶段拦截图片/媒体/字体的自动加载（图片字节改用页面内 fetch 单独拿，省一半网络）
+//   - 详情页用 domcontentloaded（不再死等 networkidle2），更快
+//   - 图片字节经 base64 回传（替代逐字节 JSON 数组，体积约 1/3、快很多）
+//   - 笔记之间随机停顿 + 每 40 篇分批休息，打散等间隔高频翻页的检测特征
+//   - 撞到风控（验证/频繁提示）自动停止以保护账号，配合断点续传下次接着下
+//   - --max-notes N：本次最多处理 N 篇笔记后停止（分批下载用）
 //
 // Verified on: Windows 11 + Chrome + Node.js 22
 // Requires: puppeteer-core (install: npm install puppeteer-core)
@@ -16,11 +24,13 @@ let OUTPUT_DIR = null;
 let CHROME_PATH = null;
 let USER_DATA_DIR = null;
 let SKIP_LOGIN = false;
+let MAX_NOTES = Infinity;
 
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--chrome' && args[i + 1]) { CHROME_PATH = path.resolve(args[++i]); }
   else if (args[i] === '--profile' && args[i + 1]) { USER_DATA_DIR = path.resolve(args[++i]); }
   else if (args[i] === '--skip-login') { SKIP_LOGIN = true; }
+  else if (args[i] === '--max-notes' && args[i + 1]) { MAX_NOTES = parseInt(args[++i], 10) || Infinity; }
   else if (!PROFILE_URL) { PROFILE_URL = args[i]; }
   else if (!OUTPUT_DIR) { OUTPUT_DIR = path.resolve(args[i]); }
 }
@@ -106,6 +116,7 @@ if (!puppeteer?.launch) {
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const stamp = () => new Date().toLocaleTimeString();
 const log = (...args) => console.log(stamp(), ...args);
+const rand = (a, b) => a + Math.floor(Math.random() * (b - a)); // 反爬节奏：随机区间 [a, b)
 
 async function isLoggedIn(page) {
   try {
@@ -173,18 +184,31 @@ async function extractXsec(page) {
   });
 }
 
+// 返回值：>=0 = 本篇成功下载的图片数；-1 = 检测到风控，主循环应立即停止
 async function downloadNote(page, noteId, xsec, uid, outputDir) {
   const url = xsec
     ? `https://www.xiaohongshu.com/user/profile/${uid}/${noteId}?xsec_token=${xsec}&xsec_source=pc_user`
     : `https://www.xiaohongshu.com/explore/${noteId}`;
 
-  try { await page.goto(url, { waitUntil: 'networkidle2', timeout: 25000 }); } catch(e) { return 0; }
-  await sleep(1200);
+  // domcontentloaded 即可——图片字节后面单独 fetch，不必死等 networkidle2（更快、请求更少）
+  try { await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 }); } catch(e) { return 0; }
+  await page.waitForSelector('img', { timeout: 8000 }).catch(() => {});
+  await sleep(rand(600, 1200));
   if (page.url().includes('error') || page.url().includes('404')) return 0;
 
+  // 风控检测：撞到验证/频繁提示就停，别硬刚（保护账号）
+  const blocked = await page.evaluate(() => {
+    const t = ((document.body && document.body.innerText) || '').slice(0, 300);
+    if (/验证码|滑动验证|操作过于频繁|访问异常|请完成|拼图/.test(t)) return true;
+    return !!document.querySelector('.captcha, [class*="captcha"], [class*="verify-"], .vc-container');
+  });
+  if (blocked) return -1;
+
+  // 抓笔记图片 URL（含懒加载 data-src）
   const imgs = await page.evaluate(() =>
     [...new Set(Array.from(document.querySelectorAll('img'))
-      .map(i => i.src).filter(s => s && s.includes('xhscdn.com') && !s.includes('avatar') && !s.includes('fe-platform')))]
+      .map(i => i.src || i.getAttribute('data-src') || '')
+      .filter(s => s && s.includes('xhscdn.com') && !s.includes('avatar') && !s.includes('fe-platform')))]
   );
 
   const pref = noteId.slice(0, 8);
@@ -192,12 +216,29 @@ async function downloadNote(page, noteId, xsec, uid, outputDir) {
   for (let j = 0; j < imgs.length; j++) {
     const fp = path.join(outputDir, `${pref}_${(j+1).toString().padStart(2,'0')}.webp`);
     if (fs.existsSync(fp) && fs.statSync(fp).size > 5000) { cnt++; continue; }
-    
-    const data = await page.evaluate(async (u) => {
-      try { const r = await fetch(u); if (!r.ok) return null; const b = await r.arrayBuffer(); return Array.from(new Uint8Array(b)); } catch(e) { return null; }
+
+    // 页面内 fetch 拿正确 Referer；用 FileReader 转 base64 回传（比逐字节 JSON 数组小约 3 倍、快很多）
+    // 注意：这里的 fetch 是 resourceType 'fetch'，不会被下载阶段的图片拦截命中
+    const b64 = await page.evaluate(async (u) => {
+      try {
+        const r = await fetch(u);
+        if (!r.ok) return null;
+        const blob = await r.blob();
+        return await new Promise(res => {
+          const fr = new FileReader();
+          fr.onloadend = () => res((fr.result || '').toString().split(',')[1] || null);
+          fr.onerror = () => res(null);
+          fr.readAsDataURL(blob);
+        });
+      } catch(e) { return null; }
     }, imgs[j]);
-    
-    if (data && data.length > 5000) { fs.writeFileSync(fp, Buffer.from(data)); cnt++; }
+
+    if (b64) {
+      const buf = Buffer.from(b64, 'base64');
+      if (buf.length > 5000) {
+        try { fs.writeFileSync(fp, buf); cnt++; } catch(e) { log(`  写盘失败 ${fp}: ${e.message}`); }
+      }
+    }
   }
   return cnt;
 }
@@ -218,11 +259,20 @@ async function main() {
   if (!uidMatch) { log('ERROR: Cannot extract user ID from URL'); process.exit(1); }
   const uid = uidMatch[1];
 
+  // --no-sandbox 是必需的，所有平台无条件保留：实测部分 Windows 环境（含 Git Bash）
+  // 不加它 Chrome 无法启动；原脚本所有笔记也都是带此参数在 Windows 上跑通的。请勿移除。
+  const launchArgs = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-blink-features=AutomationControlled',
+    '--no-first-run',
+  ];
+
   const browser = await puppeteer.launch({
     executablePath: CHROME_PATH,
     userDataDir: USER_DATA_DIR,
     headless: false,
-    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-blink-features=AutomationControlled','--no-first-run'],
+    args: launchArgs,
     ignoreDefaultArgs: ['--enable-automation'],
   });
 
@@ -251,16 +301,45 @@ async function main() {
         .filter(f => /^[0-9a-f]+_\d+\.webp$/.test(f))
         .map(f => f.split('_')[0])
     );
-    const todo = entries.filter(([n]) => !saved.has(n.slice(0, 8)));
+    let todo = entries.filter(([n]) => !saved.has(n.slice(0, 8)));
+    if (todo.length > MAX_NOTES) {
+      log(`本次限 ${MAX_NOTES} 篇（--max-notes），其余下次断点续传`);
+      todo = todo.slice(0, MAX_NOTES);
+    }
     log(`New: ${todo.length}, Done: ${entries.length - todo.length}\n`);
+
+    // 下载阶段才开启资源拦截：abort 图片/媒体/字体的自动加载（图片字节后面用 fetch 单独拿）。
+    // 放在登录/滚动之后，避免影响二维码显示和主页缩略图懒加载。
+    await page.setRequestInterception(true);
+    page.on('request', req => {
+      const t = req.resourceType();
+      if (t === 'image' || t === 'media' || t === 'font') req.abort().catch(() => {});
+      else req.continue().catch(() => {});
+    });
 
     let total = 0;
     for (let i = 0; i < todo.length; i++) {
       const [nid, xsec] = todo[i];
       console.log(`[${i+1}/${todo.length}] ${nid.slice(0,8)}`);
       const cnt = await downloadNote(page, nid, xsec, uid, OUTPUT_DIR);
+
+      if (cnt === -1) {
+        log('⚠️ 触发小红书风控（验证/频繁提示），已停止以保护账号。');
+        log('   建议歇一阵（数小时~一天）再跑；已下载的会自动跳过（断点续传）。');
+        break;
+      }
+
       total += cnt;
       console.log(`  → ${cnt} images (total: ${total})`);
+
+      // 反爬节奏：笔记之间随机停顿，避免等间隔高频翻页
+      await sleep(rand(2000, 5000));
+      // 每 40 篇喝口水，进一步打散节奏
+      if ((i + 1) % 40 === 0 && i + 1 < todo.length) {
+        const restMs = rand(30000, 90000);
+        log(`  已处理 ${i + 1} 篇，分批休息 ${Math.round(restMs / 1000)}s…`);
+        await sleep(restMs);
+      }
     }
 
     const all = fs.readdirSync(OUTPUT_DIR).filter(f => /^[0-9a-f]+_\d+\.webp$/.test(f));

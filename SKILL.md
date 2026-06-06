@@ -85,6 +85,7 @@ node scripts/bulk-download.mjs <profile_url> <output_dir> [options]
 | `--chrome <path>` | 否 | Chrome 可执行文件路径（自动检测） |
 | `--profile <path>` | 否 | Chrome 用户数据目录（默认系统临时目录） |
 | `--skip-login` | 否 | 跳过登录等待（当用户确认已登录时使用） |
+| `--max-notes <n>` | 否 | 本次最多处理 n 篇笔记后停止（分批下载，配合断点续传） |
 
 脚本内步骤：
 1. 自动检测 Chrome 路径
@@ -103,3 +104,4 @@ node scripts/bulk-download.mjs <profile_url> <output_dir> [options]
 - 主页滚动最多 ~70 篇笔记，更早期的需要 API（CORS 阻止）
 - 图片 URL 有时效性，不能先收集再批量下载——必须边访问边下载
 - 每篇笔记需要约 5-8 秒（导航+下载），总时间取决于笔记数量
+- 小红书对短时间内高频翻详情页有行为风控。脚本已内置随机停顿 + 每 40 篇分批休息 + 撞风控（验证/频繁提示）自动停以保护账号；一次量很大时建议 `--max-notes` 分批跑，断点续传自动跳过已下的
