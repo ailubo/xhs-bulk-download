@@ -1,17 +1,20 @@
 #!/usr/bin/env node
-// XHS Bulk Image Downloader v2.1 — Generic, portable, single-file
+// XHS Bulk Image Downloader v2.3 — Universal skill for any XHS blogger
 // Usage: node bulk-download.mjs <profile_url> <output_dir> [--chrome PATH] [--profile DIR] [--skip-login] [--max-notes N]
 //
-// v2.1 反爬 + 效率改进：
-//   - 下载阶段拦截图片/媒体/字体的自动加载（图片字节改用页面内 fetch 单独拿，省一半网络）
-//   - 详情页用 domcontentloaded（不再死等 networkidle2），更快
-//   - 图片字节经 base64 回传（替代逐字节 JSON 数组，体积约 1/3、快很多）
-//   - 笔记之间随机停顿 + 每 40 篇分批休息，打散等间隔高频翻页的检测特征
-//   - 撞到风控（验证/频繁提示）自动停止以保护账号，配合断点续传下次接着下
-//   - --max-notes N：本次最多处理 N 篇笔记后停止（分批下载用）
+// v2.3 通用化改进（2026-06-07）：
+//   - xsec 缓存：滚动结果存 .xhs-xsec-cache.json，下次跳过滚动直接下载
+//   - 已尝试追踪：.xhs-attempted.json 记录已尝试笔记（含纯文字），避免重复浪费请求
+//   - 滚动中检测风控：300013 / 访问频繁等立即停止
+//   - 滚动节奏放缓：3-6s 随机间隔，最大 30 轮
+//   - 下载节奏放缓：12-20s 间隔，每 10 篇休息 4-6 分钟
+//   - 默认 --max-notes 50（防止一次性全量触发风控）
+//   - 支持断点续传：已下载图片自动跳过
 //
-// Verified on: Windows 11 + Chrome + Node.js 22
-// Requires: puppeteer-core (install: npm install puppeteer-core)
+// v2.1 反爬 + 效率改进：
+//   - 下载阶段拦截图片/媒体/字体的自动加载
+//   - 详情页用 domcontentloaded
+//   - 图片字节经 base64 回传
 
 import fs from 'fs';
 import path from 'path';
@@ -24,7 +27,7 @@ let OUTPUT_DIR = null;
 let CHROME_PATH = null;
 let USER_DATA_DIR = null;
 let SKIP_LOGIN = false;
-let MAX_NOTES = Infinity;
+let MAX_NOTES = 50;  // 默认每次最多 50 篇，避免触发风控
 
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--chrome' && args[i + 1]) { CHROME_PATH = path.resolve(args[++i]); }
@@ -175,41 +178,49 @@ async function ensureLogin(page) {
     log('Profile loaded but 0 xsec tokens — likely guest mode.');
   }
   
-  // 需要登录：打开登录页
-  log('Opening login page. SCAN QR CODE in the browser window.');
-  await page.goto('https://www.xiaohongshu.com/login', { waitUntil: 'networkidle2' }).catch(() => {});
-  
-  for (let i = 0; i < 100; i++) {
+  // 需要登录：打开登录页，等待扫码（用 waitForNavigation 检测登录成功，不轮询页面）
+  log('Opening login page. SCAN QR CODE in the browser window (5 min timeout).');
+  await page.goto('https://www.xiaohongshu.com/login', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+  await sleep(3000);  // 等二维码渲染完
+
+  // 等待登录后的页面跳转（最长 5 分钟），不轮询不触发刷新
+  try {
+    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 300000 });
+    log('Page navigated — checking login...');
+  } catch(e) { /* timeout, check cookie anyway */ }
+
+  const status = await isLoggedIn(page);
+  if (status.loggedIn) {
+    log(`Login detected: ${status.nickname}`);
+    await page.goto(PROFILE_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
     await sleep(3000);
-    const status = await isLoggedIn(page);
-    if (status.loggedIn) {
-      log(`Login detected: ${status.nickname}`);
-      // 验证：回到个人主页确认有效
-      await page.goto(PROFILE_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-      await sleep(3000);
-      const verifyMap = await extractXsec(page);
-      if (Object.keys(verifyMap).length > 0) {
-        log(`Verified: ${Object.keys(verifyMap).length} xsec available`);
-        return true;
-      }
-      log('Login detected but profile still in guest mode — retrying...');
+    const verifyMap = await extractXsec(page);
+    if (Object.keys(verifyMap).length > 0) {
+      log(`Verified: ${Object.keys(verifyMap).length} xsec available`);
+      return true;
     }
-    if (i === 30) log('Still waiting for QR code scan...');
+    log('Login detected but profile still in guest mode');
   }
-  log('LOGIN TIMEOUT. Please log in manually and re-run.');
+  log('LOGIN FAILED. Please log in manually and re-run.');
   return false;
 }
 
 async function patientScroll(page) {
-  log('Incremental scroll + xsec extraction...');
-  let prev = 0, same = 0;
-  // FIRST: extract xsec from current viewport (newest notes at top!)
+  log('Gentle scroll (3-6s delay) + xsec extraction...');
+  let prev = 0, same = 0, blocked = false;
   const xsecMap = await extractXsec(page);
   log(`  Initial view: ${Object.keys(xsecMap).length} xsec`);
-  for (let r = 1; r <= 100; r++) {
-    // Scroll ONE screen at a time, not jump-to-bottom
+  for (let r = 1; r <= 30 && !blocked; r++) {
     await page.evaluate(() => window.scrollBy(0, 800));
-    await sleep(2000);
+    // 反爬：滚动间隔 3-6 秒随机，不打散等间隔特征
+    await sleep(rand(3000, 6000));
+    // 滚动过程中检测风控
+    blocked = await page.evaluate(() => {
+      const t = ((document.body && document.body.innerText) || '').slice(0, 200);
+      return /安全验证|访问频繁|操作过于频繁|访问异常/.test(t)
+        || /error_code=/.test(window.location.href);
+    });
+    if (blocked) { log('  ⚠️ 滚动中触发风控，停止翻页'); break; }
     const before = Object.keys(xsecMap).length;
     Object.assign(xsecMap, await extractXsec(page));
     const added = Object.keys(xsecMap).length - before;
@@ -248,11 +259,12 @@ async function downloadNote(page, noteId, xsec, uid, outputDir) {
   await sleep(2000);
   if (page.url().includes('error') || page.url().includes('404')) return 0;
 
-  // 风控检测：撞到验证/频繁提示就停（实测 XHS 会显示 "安全验证" / "请勿频繁操作"）
+  // 风控检测：撞到验证/频繁提示就停（实测 XHS 会显示 "安全验证" / "请勿频繁操作" / "访问频繁"）
   const blocked = await page.evaluate(() => {
     const t = ((document.body && document.body.innerText) || '').slice(0, 300);
-    if (/安全验证|请勿频繁操作|操作过于频繁|访问异常|验证码/.test(t)) return true;
+    if (/安全验证|请勿频繁操作|操作过于频繁|访问异常|验证码|访问频繁/.test(t)) return true;
     if (/\/captcha|\/sec_/.test(window.location.href)) return true;
+    if (/error_code=/.test(window.location.href)) return true;
     return !!document.querySelector('.captcha, [class*="captcha"], [class*="verify-"]');
   });
   if (blocked) return -1;
@@ -342,21 +354,59 @@ async function main() {
       process.exit(1);
     }
 
-    const xsecMap = await patientScroll(page);
+    // ── xsec 缓存：优先用上次滚动的结果，跳过滚动阶段 ──
+    const xsecCacheFile = path.join(OUTPUT_DIR, '.xhs-xsec-cache.json');
+    let xsecMap, cached = null;
+    if (fs.existsSync(xsecCacheFile)) {
+      try {
+        cached = JSON.parse(fs.readFileSync(xsecCacheFile, 'utf-8'));
+        if (cached && typeof cached === 'object' && Object.keys(cached).length > 0) {
+          xsecMap = cached;
+          log(`Loaded ${Object.keys(xsecMap).length} cached xsec tokens, skipping scroll`);
+        }
+      } catch(e) { /* fall through to scroll */ }
+    }
+    if (!xsecMap) {
+      xsecMap = await patientScroll(page);
+    }
+    // 保存滚动结果到缓存（合并新旧）
+    try { fs.writeFileSync(xsecCacheFile, JSON.stringify(xsecMap)); } catch(e) {}
     const entries = Object.entries(xsecMap);
     log(`Extracted ${entries.length} xsec tokens`);
 
+    // 断点续传：已下载图片 + 已尝试过的笔记（含纯文字笔记）都跳过
     const saved = new Set(
       fs.readdirSync(OUTPUT_DIR)
         .filter(f => /^[0-9a-f]+_\d+\.webp$/.test(f))
         .map(f => f.split('_')[0])
     );
-    let todo = entries.filter(([n]) => !saved.has(n.slice(0, 8)));
+    // 加载"已尝试"记录（纯文字笔记也有记录，避免每次重试浪费请求）
+    const attemptedFile = path.join(OUTPUT_DIR, '.xhs-attempted.json');
+    let attempted = saved; // 有图片的肯定已尝试
+    if (fs.existsSync(attemptedFile)) {
+      try {
+        const arr = JSON.parse(fs.readFileSync(attemptedFile, 'utf-8'));
+        arr.forEach(n => attempted.add(n));
+        log(`Loaded ${arr.length} attempted notes from .xhs-attempted.json`);
+      } catch(e) { /* ignore corrupted file */ }
+    }
+    let todo = entries.filter(([n]) => !attempted.has(n.slice(0, 8)));
     if (todo.length > MAX_NOTES) {
       log(`本次限 ${MAX_NOTES} 篇（--max-notes），其余下次断点续传`);
       todo = todo.slice(0, MAX_NOTES);
     }
     log(`New: ${todo.length}, Done: ${entries.length - todo.length}\n`);
+
+    // 如果用了缓存但没有新笔记待处理，可能是博主发了新内容，重新滚动获取新 xsec
+    if (todo.length === 0 && xsecMap === cached) {
+      log('Cached xsec has 0 new notes — re-scrolling to discover new content...');
+      xsecMap = await patientScroll(page);
+      try { fs.writeFileSync(xsecCacheFile, JSON.stringify(xsecMap)); } catch(e) {}
+      const entries2 = Object.entries(xsecMap);
+      log(`Re-scroll: ${entries2.length} xsec tokens`);
+      todo = entries2.filter(([n]) => !attempted.has(n.slice(0, 8)));
+      log(`New after re-scroll: ${todo.length}\n`);
+    }
 
     // 下载阶段才开启资源拦截：abort 图片/媒体/字体的自动加载（图片字节后面用 fetch 单独拿）。
     // 放在登录/滚动之后，避免影响二维码显示和主页缩略图懒加载。
@@ -374,6 +424,9 @@ async function main() {
       const cnt = await downloadNote(page, nid, xsec, uid, OUTPUT_DIR);
 
       if (cnt === -1) {
+        // 也记录本次触发风控的笔记，避免下次又重试它触发相同风控
+        attempted.add(nid.slice(0, 8));
+        try { fs.writeFileSync(attemptedFile, JSON.stringify([...attempted])); } catch(e) {}
         log('⚠️ 触发小红书风控（验证/频繁提示），已停止以保护账号。');
         log('   建议歇一阵（数小时~一天）再跑；已下载的会自动跳过（断点续传）。');
         break;
@@ -382,10 +435,14 @@ async function main() {
       total += cnt;
       console.log(`  → ${cnt} images (total: ${total})`);
 
-      // 反爬节奏：笔记之间 8-15s 随机停顿 + 每 15 篇休息 3-5 分钟
-      await sleep(rand(8000, 15000));
-      if ((i + 1) % 15 === 0 && i + 1 < todo.length) {
-        const restMs = rand(180000, 300000);
+      // 记录已尝试（纯文字笔记也记录，避免下次重试浪费请求）
+      attempted.add(nid.slice(0, 8));
+      try { fs.writeFileSync(attemptedFile, JSON.stringify([...attempted])); } catch(e) {}
+
+      // 反爬节奏：笔记之间 12-20s 随机停顿 + 每 10 篇休息 4-6 分钟
+      await sleep(rand(12000, 20000));
+      if ((i + 1) % 10 === 0 && i + 1 < todo.length) {
+        const restMs = rand(240000, 360000);
         log(`  🍵 ${i + 1} 篇完成，休息 ${Math.round(restMs / 1000 / 60)} 分钟…`);
         await sleep(restMs);
       }
