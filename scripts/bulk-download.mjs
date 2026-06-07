@@ -5,10 +5,11 @@
 // v2.3 通用化改进（2026-06-07）：
 //   - xsec 缓存：滚动结果存 .xhs-xsec-cache.json，下次跳过滚动直接下载
 //   - 已尝试追踪：.xhs-attempted.json 记录已尝试笔记（含纯文字），避免重复浪费请求
-//   - 滚动中检测风控：300013 / 访问频繁等立即停止
-//   - 滚动节奏放缓：3-6s 随机间隔，最大 30 轮
-//   - 下载节奏放缓：12-20s 间隔，每 10 篇休息 4-6 分钟
-//   - 默认 --max-notes 50（防止一次性全量触发风控）
+//   - 滚动中检测风控：300013 / 访问频繁等立即停止并写入冷却文件
+//   - 滚动节奏放缓：15-30s 随机间隔，默认最大 5 轮
+//   - 下载节奏放缓：笔记间 90-180s 间隔，每 3 篇长休息
+//   - 默认 --max-notes 8（小批量运行，降低 300013 风险）
+//   - 默认使用稳定 Chrome profile：~/.xhs-bulk-download-profile
 //   - 支持断点续传：已下载图片自动跳过
 //
 // v2.1 反爬 + 效率改进：
@@ -27,13 +28,27 @@ let OUTPUT_DIR = null;
 let CHROME_PATH = null;
 let USER_DATA_DIR = null;
 let SKIP_LOGIN = false;
-let MAX_NOTES = 50;  // 默认每次最多 50 篇，避免触发风控
+let MAX_NOTES = 8;  // Conservative default: small batches reduce XHS 300013 risk.
+let MAX_SCROLL_ROUNDS = 5;
+let REFRESH_CACHE = false;
+let IGNORE_COOLDOWN = false;
+let COOLDOWN_HOURS = 24;
+let NOTE_DELAY_MIN = 90000;
+let NOTE_DELAY_MAX = 180000;
+let IMAGE_DELAY_MIN = 2500;
+let IMAGE_DELAY_MAX = 6500;
+let SCROLL_DELAY_MIN = 15000;
+let SCROLL_DELAY_MAX = 30000;
 
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--chrome' && args[i + 1]) { CHROME_PATH = path.resolve(args[++i]); }
   else if (args[i] === '--profile' && args[i + 1]) { USER_DATA_DIR = path.resolve(args[++i]); }
   else if (args[i] === '--skip-login') { SKIP_LOGIN = true; }
+  else if (args[i] === '--refresh') { REFRESH_CACHE = true; }
+  else if (args[i] === '--ignore-cooldown') { IGNORE_COOLDOWN = true; }
   else if (args[i] === '--max-notes' && args[i + 1]) { MAX_NOTES = parseInt(args[++i], 10) || Infinity; }
+  else if (args[i] === '--max-scroll-rounds' && args[i + 1]) { MAX_SCROLL_ROUNDS = parseInt(args[++i], 10) || 0; }
+  else if (args[i] === '--cooldown-hours' && args[i + 1]) { COOLDOWN_HOURS = parseInt(args[++i], 10) || 24; }
   else if (!PROFILE_URL) { PROFILE_URL = args[i]; }
   else if (!OUTPUT_DIR) { OUTPUT_DIR = path.resolve(args[i]); }
 }
@@ -63,7 +78,7 @@ if (!CHROME_PATH) {
 }
 
 if (!USER_DATA_DIR) {
-  USER_DATA_DIR = path.join(os.tmpdir(), 'xhs-bulk-download-profile');
+  USER_DATA_DIR = path.join(os.homedir(), '.xhs-bulk-download-profile');
 }
 
 // ──────────────── Import puppeteer ────────────────
@@ -120,6 +135,45 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const stamp = () => new Date().toLocaleTimeString();
 const log = (...args) => console.log(stamp(), ...args);
 const rand = (a, b) => a + Math.floor(Math.random() * (b - a)); // 反爬节奏：随机区间 [a, b)
+
+function readJson(file, fallback) {
+  try {
+    if (!fs.existsSync(file)) return fallback;
+    return JSON.parse(fs.readFileSync(file, 'utf-8'));
+  } catch(e) {
+    return fallback;
+  }
+}
+
+function writeJson(file, value) {
+  try {
+    fs.writeFileSync(file, JSON.stringify(value, null, 2));
+  } catch(e) {}
+}
+
+function isRiskText(text, url = '') {
+  return /300013|安全限制|访问频繁|访问异常|操作过于频繁|请稍后再试|安全验证|验证码|滑动验证|拼图|captcha|verify/i.test(text || '')
+    || /error_code=300013|\/captcha|\/sec_|verify/i.test(url || '');
+}
+
+function getCooldown(cooldownFile) {
+  const data = readJson(cooldownFile, null);
+  if (!data?.until) return null;
+  const until = new Date(data.until);
+  if (Number.isNaN(until.getTime()) || until <= new Date()) return null;
+  return { ...data, until };
+}
+
+function setCooldown(cooldownFile, reason) {
+  const until = new Date(Date.now() + COOLDOWN_HOURS * 60 * 60 * 1000);
+  writeJson(cooldownFile, {
+    reason,
+    until: until.toISOString(),
+    cooldownHours: COOLDOWN_HOURS,
+    createdAt: new Date().toISOString(),
+  });
+  return until;
+}
 
 async function isLoggedIn(page) {
   // 多维度检测登录态：INITIAL_STATE 不可靠（首页经常未填充），
@@ -206,26 +260,30 @@ async function ensureLogin(page) {
 }
 
 async function patientScroll(page) {
-  log('Gentle scroll (3-6s delay) + xsec extraction...');
+  if (MAX_SCROLL_ROUNDS <= 0) {
+    log('Scroll disabled (--max-scroll-rounds 0). Using current viewport only.');
+    return await extractXsec(page);
+  }
+  log(`Gentle scroll (${Math.round(SCROLL_DELAY_MIN / 1000)}-${Math.round(SCROLL_DELAY_MAX / 1000)}s delay, max ${MAX_SCROLL_ROUNDS} rounds) + xsec extraction...`);
   let prev = 0, same = 0, blocked = false;
   const xsecMap = await extractXsec(page);
   log(`  Initial view: ${Object.keys(xsecMap).length} xsec`);
-  for (let r = 1; r <= 30 && !blocked; r++) {
-    await page.evaluate(() => window.scrollBy(0, 800));
+  for (let r = 1; r <= MAX_SCROLL_ROUNDS && !blocked; r++) {
+    await page.evaluate(() => window.scrollBy(0, Math.floor(450 + Math.random() * 450)));
     // 反爬：滚动间隔 3-6 秒随机，不打散等间隔特征
-    await sleep(rand(3000, 6000));
+    await sleep(rand(SCROLL_DELAY_MIN, SCROLL_DELAY_MAX));
     // 滚动过程中检测风控
     blocked = await page.evaluate(() => {
-      const t = ((document.body && document.body.innerText) || '').slice(0, 200);
-      return /安全验证|访问频繁|操作过于频繁|访问异常/.test(t)
-        || /error_code=/.test(window.location.href);
+      const t = ((document.body && document.body.innerText) || '').slice(0, 500);
+      return /300013|安全限制|请稍后再试|安全验证|访问频繁|操作过于频繁|访问异常/.test(t)
+        || /error_code=300013|\/captcha|\/sec_/.test(window.location.href);
     });
     if (blocked) { log('  ⚠️ 滚动中触发风控，停止翻页'); break; }
     const before = Object.keys(xsecMap).length;
     Object.assign(xsecMap, await extractXsec(page));
     const added = Object.keys(xsecMap).length - before;
     const cnt = await page.evaluate(() => document.querySelectorAll('section.note-item').length);
-    if (cnt === prev) { same++; if (same >= 5) break; }
+    if (cnt === prev) { same++; if (same >= 2) break; }
     else { same = 0; prev = cnt; log(`  ${cnt} notes, +${added} xsec = ${Object.keys(xsecMap).length} total (round ${r})`); }
   }
   log(`Total: ${prev} notes, ${Object.keys(xsecMap).length} xsec tokens`);
@@ -256,18 +314,16 @@ async function downloadNote(page, noteId, xsec, uid, outputDir) {
   // 等笔记详情容器出现（比等任意 img 更可靠）
   await page.waitForSelector('.note-scroller, [class*="note-"], #detail-desc', { timeout: 10000 }).catch(() => {});
   // 再给 React 一点时间渲染图片
-  await sleep(2000);
+  await sleep(rand(8000, 18000));
   if (page.url().includes('error') || page.url().includes('404')) return 0;
 
   // 风控检测：撞到验证/频繁提示就停（实测 XHS 会显示 "安全验证" / "请勿频繁操作" / "访问频繁"）
-  const blocked = await page.evaluate(() => {
-    const t = ((document.body && document.body.innerText) || '').slice(0, 300);
-    if (/安全验证|请勿频繁操作|操作过于频繁|访问异常|验证码|访问频繁/.test(t)) return true;
-    if (/\/captcha|\/sec_/.test(window.location.href)) return true;
-    if (/error_code=/.test(window.location.href)) return true;
-    return !!document.querySelector('.captcha, [class*="captcha"], [class*="verify-"]');
+  const riskState = await page.evaluate(() => {
+    const text = ((document.body && document.body.innerText) || '').slice(0, 800);
+    const hasRiskElement = !!document.querySelector('.captcha, [class*="captcha"], [class*="verify-"]');
+    return { text, url: window.location.href, hasRiskElement };
   });
-  if (blocked) return -1;
+  if (riskState.hasRiskElement || isRiskText(riskState.text, riskState.url)) return -1;
 
   // 抓笔记图片 URL（含懒加载 data-src）
   const imgs = await page.evaluate(() =>
@@ -304,6 +360,9 @@ async function downloadNote(page, noteId, xsec, uid, outputDir) {
         try { fs.writeFileSync(fp, buf); cnt++; } catch(e) { log(`  写盘失败 ${fp}: ${e.message}`); }
       }
     }
+    if (j < imgs.length - 1) {
+      await sleep(rand(IMAGE_DELAY_MIN, IMAGE_DELAY_MAX));
+    }
   }
   return cnt;
 }
@@ -316,8 +375,18 @@ async function main() {
   log(`Chrome:      ${CHROME_PATH}`);
   log(`Profile:     ${USER_DATA_DIR}`);
   log(`Skip login:  ${SKIP_LOGIN}`);
+  log(`Max notes:   ${MAX_NOTES}`);
+  log(`Max scroll:  ${MAX_SCROLL_ROUNDS}`);
+  log(`Refresh:     ${REFRESH_CACHE}`);
 
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+  const cooldownFile = path.join(OUTPUT_DIR, '.xhs-cooldown.json');
+  const cooldown = getCooldown(cooldownFile);
+  if (cooldown && !IGNORE_COOLDOWN) {
+    log(`Cooldown active until ${cooldown.until.toLocaleString()}. Reason: ${cooldown.reason || 'risk control'}`);
+    log('Use --ignore-cooldown only if you have manually confirmed the account is normal again.');
+    process.exit(1);
+  }
 
   // Extract user ID from URL
   const uidMatch = PROFILE_URL.match(/profile\/([a-f0-9]{24})/);
@@ -353,11 +422,21 @@ async function main() {
       await browser.close();
       process.exit(1);
     }
+    const initialRisk = await page.evaluate(() => ({
+      text: ((document.body && document.body.innerText) || '').slice(0, 800),
+      url: window.location.href,
+    })).catch(() => ({ text: '', url: page.url() }));
+    if (isRiskText(initialRisk.text, initialRisk.url)) {
+      const until = setCooldown(cooldownFile, 'risk detected while opening profile');
+      log(`Risk control detected on profile page. Cooling down until ${until.toLocaleString()}.`);
+      await browser.close();
+      process.exit(1);
+    }
 
     // ── xsec 缓存：优先用上次滚动的结果，跳过滚动阶段 ──
     const xsecCacheFile = path.join(OUTPUT_DIR, '.xhs-xsec-cache.json');
     let xsecMap, cached = null;
-    if (fs.existsSync(xsecCacheFile)) {
+    if (!REFRESH_CACHE && fs.existsSync(xsecCacheFile)) {
       try {
         cached = JSON.parse(fs.readFileSync(xsecCacheFile, 'utf-8'));
         if (cached && typeof cached === 'object' && Object.keys(cached).length > 0) {
@@ -368,6 +447,16 @@ async function main() {
     }
     if (!xsecMap) {
       xsecMap = await patientScroll(page);
+    }
+    const scrollRisk = await page.evaluate(() => ({
+      text: ((document.body && document.body.innerText) || '').slice(0, 800),
+      url: window.location.href,
+    })).catch(() => ({ text: '', url: page.url() }));
+    if (isRiskText(scrollRisk.text, scrollRisk.url)) {
+      const until = setCooldown(cooldownFile, 'risk detected while scrolling profile');
+      log(`Risk control detected while scrolling. Cooling down until ${until.toLocaleString()}.`);
+      await browser.close();
+      process.exit(1);
     }
     // 保存滚动结果到缓存（合并新旧）
     try { fs.writeFileSync(xsecCacheFile, JSON.stringify(xsecMap)); } catch(e) {}
@@ -397,15 +486,9 @@ async function main() {
     }
     log(`New: ${todo.length}, Done: ${entries.length - todo.length}\n`);
 
-    // 如果用了缓存但没有新笔记待处理，可能是博主发了新内容，重新滚动获取新 xsec
-    if (todo.length === 0 && xsecMap === cached) {
-      log('Cached xsec has 0 new notes — re-scrolling to discover new content...');
-      xsecMap = await patientScroll(page);
-      try { fs.writeFileSync(xsecCacheFile, JSON.stringify(xsecMap)); } catch(e) {}
-      const entries2 = Object.entries(xsecMap);
-      log(`Re-scroll: ${entries2.length} xsec tokens`);
-      todo = entries2.filter(([n]) => !attempted.has(n.slice(0, 8)));
-      log(`New after re-scroll: ${todo.length}\n`);
+    // Keep cached runs quiet by default. Use --refresh to intentionally scroll for newly posted notes.
+    if (todo.length === 0 && xsecMap === cached && !REFRESH_CACHE) {
+      log('Cached xsec has 0 new notes. Not re-scrolling by default; use --refresh when you want to scan for new content.');
     }
 
     // 下载阶段才开启资源拦截：abort 图片/媒体/字体的自动加载（图片字节后面用 fetch 单独拿）。
@@ -427,8 +510,9 @@ async function main() {
         // 也记录本次触发风控的笔记，避免下次又重试它触发相同风控
         attempted.add(nid.slice(0, 8));
         try { fs.writeFileSync(attemptedFile, JSON.stringify([...attempted])); } catch(e) {}
+        const until = setCooldown(cooldownFile, 'risk detected while opening/downloading note');
         log('⚠️ 触发小红书风控（验证/频繁提示），已停止以保护账号。');
-        log('   建议歇一阵（数小时~一天）再跑；已下载的会自动跳过（断点续传）。');
+        log(`   已进入冷却，${until.toLocaleString()} 前默认不再运行；已下载的会自动跳过（断点续传）。`);
         break;
       }
 
@@ -439,11 +523,15 @@ async function main() {
       attempted.add(nid.slice(0, 8));
       try { fs.writeFileSync(attemptedFile, JSON.stringify([...attempted])); } catch(e) {}
 
-      // 反爬节奏：笔记之间 12-20s 随机停顿 + 每 10 篇休息 4-6 分钟
-      await sleep(rand(12000, 20000));
-      if ((i + 1) % 10 === 0 && i + 1 < todo.length) {
-        const restMs = rand(240000, 360000);
-        log(`  🍵 ${i + 1} 篇完成，休息 ${Math.round(restMs / 1000 / 60)} 分钟…`);
+      // Keep detail-page visits sparse. This is intentionally slow to reduce 300013 risk.
+      if (i < todo.length - 1) {
+        const noteDelay = rand(NOTE_DELAY_MIN, NOTE_DELAY_MAX);
+        log(`  Pausing ${Math.round(noteDelay / 1000)}s before next note...`);
+        await sleep(noteDelay);
+      }
+      if ((i + 1) % 3 === 0 && i + 1 < todo.length) {
+        const restMs = rand(1800000, 3600000);
+        log(`  ${i + 1} notes completed. Long rest ${Math.round(restMs / 1000 / 60)} minutes...`);
         await sleep(restMs);
       }
     }
