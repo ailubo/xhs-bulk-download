@@ -151,9 +151,15 @@ function writeJson(file, value) {
   } catch(e) {}
 }
 
-function isRiskText(text, url = '') {
-  return /300013|安全限制|访问频繁|访问异常|操作过于频繁|请稍后再试|安全验证|验证码|滑动验证|拼图|captcha|verify/i.test(text || '')
-    || /error_code=300013|\/captcha|\/sec_|verify/i.test(url || '');
+// 风控判定：只用"强信号"，避免博主笔记正文里出现"验证码/拼图/安全验证"等普通词被误判，
+// 进而误写 24h 冷却把账号锁死（这些词在美妆/数码/教程/反诈类正文里极常见）。
+// - 验证码/滑块这类靠页面 DOM 元素(hasRiskElement)判定，比匹配正文文本词准确得多；
+// - 频率限制(300013)靠"错误码 + 整句风控话术 + URL 错误码"判定，这些几乎不出现在正常正文。
+// 取向：宁可偶尔漏报（headless:false 下用户能在浏览器里看到风控页并手动停），也不要误锁正常账号。
+function isRiskText(text, url = '', hasRiskElement = false) {
+  if (hasRiskElement) return true;
+  if (/error_code=300013|\/web-login\/captcha|\/captcha\?/i.test(url || '')) return true;
+  return /300013|访问频次异常|请勿频繁操作|操作过于频繁|访问过于频繁|当前访问存在风险|你的访问.{0,8}异常|请稍后再试/.test(text || '');
 }
 
 function getCooldown(cooldownFile) {
@@ -323,7 +329,7 @@ async function downloadNote(page, noteId, xsec, uid, outputDir) {
     const hasRiskElement = !!document.querySelector('.captcha, [class*="captcha"], [class*="verify-"]');
     return { text, url: window.location.href, hasRiskElement };
   });
-  if (riskState.hasRiskElement || isRiskText(riskState.text, riskState.url)) return -1;
+  if (isRiskText(riskState.text, riskState.url, riskState.hasRiskElement)) return -1;
 
   // 抓笔记图片 URL（含懒加载 data-src）
   const imgs = await page.evaluate(() =>
@@ -380,7 +386,10 @@ async function main() {
   log(`Refresh:     ${REFRESH_CACHE}`);
 
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-  const cooldownFile = path.join(OUTPUT_DIR, '.xhs-cooldown.json');
+  // 冷却是"账号/登录态"级别的，不是"某个输出目录"级别的——必须绑定到 Chrome profile(USER_DATA_DIR)。
+  // 否则换个博主/换个 output_dir 就读不到冷却文件，会对同一个已被限流的账号继续猛跑（正中多博主批量场景）。
+  fs.mkdirSync(USER_DATA_DIR, { recursive: true });
+  const cooldownFile = path.join(USER_DATA_DIR, '.xhs-cooldown.json');
   const cooldown = getCooldown(cooldownFile);
   if (cooldown && !IGNORE_COOLDOWN) {
     log(`Cooldown active until ${cooldown.until.toLocaleString()}. Reason: ${cooldown.reason || 'risk control'}`);
@@ -425,8 +434,9 @@ async function main() {
     const initialRisk = await page.evaluate(() => ({
       text: ((document.body && document.body.innerText) || '').slice(0, 800),
       url: window.location.href,
-    })).catch(() => ({ text: '', url: page.url() }));
-    if (isRiskText(initialRisk.text, initialRisk.url)) {
+      hasRiskElement: !!document.querySelector('.captcha, [class*="captcha"], [class*="verify-"]'),
+    })).catch(() => ({ text: '', url: page.url(), hasRiskElement: false }));
+    if (isRiskText(initialRisk.text, initialRisk.url, initialRisk.hasRiskElement)) {
       const until = setCooldown(cooldownFile, 'risk detected while opening profile');
       log(`Risk control detected on profile page. Cooling down until ${until.toLocaleString()}.`);
       await browser.close();
@@ -451,8 +461,9 @@ async function main() {
     const scrollRisk = await page.evaluate(() => ({
       text: ((document.body && document.body.innerText) || '').slice(0, 800),
       url: window.location.href,
-    })).catch(() => ({ text: '', url: page.url() }));
-    if (isRiskText(scrollRisk.text, scrollRisk.url)) {
+      hasRiskElement: !!document.querySelector('.captcha, [class*="captcha"], [class*="verify-"]'),
+    })).catch(() => ({ text: '', url: page.url(), hasRiskElement: false }));
+    if (isRiskText(scrollRisk.text, scrollRisk.url, scrollRisk.hasRiskElement)) {
       const until = setCooldown(cooldownFile, 'risk detected while scrolling profile');
       log(`Risk control detected while scrolling. Cooling down until ${until.toLocaleString()}.`);
       await browser.close();
