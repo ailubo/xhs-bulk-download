@@ -19,6 +19,7 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import vm from 'node:vm';
 
 // ──────────────── Config ────────────────
 const args = process.argv.slice(2);
@@ -28,19 +29,46 @@ let CHROME_PATH = null;
 let USER_DATA_DIR = null;
 let SKIP_LOGIN = false;
 let MAX_NOTES = 50;  // 默认每次最多 50 篇，避免触发风控
+let DOWNLOAD_MODE = 'normal';
+let LIGHT_BATCH_SIZE = 8;
+let LIGHT_SCROLL_ROUNDS = 30;
+let LIGHT_UNTIL_END = false;
+let LIGHT_REST_EVERY = 3;
+let LIGHT_REST_MIN_MS = 35000;
+let LIGHT_REST_MAX_MS = 50000;
+let USER_SUBDIR = false;
+let MAX_NOTES_SPECIFIED = false;
 
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--chrome' && args[i + 1]) { CHROME_PATH = path.resolve(args[++i]); }
   else if (args[i] === '--profile' && args[i + 1]) { USER_DATA_DIR = path.resolve(args[++i]); }
   else if (args[i] === '--skip-login') { SKIP_LOGIN = true; }
-  else if (args[i] === '--max-notes' && args[i + 1]) { MAX_NOTES = parseInt(args[++i], 10) || Infinity; }
+  else if (args[i] === '--light') { DOWNLOAD_MODE = 'light'; }
+  else if (args[i] === '--mode' && args[i + 1]) { DOWNLOAD_MODE = args[++i]; }
+  else if (args[i] === '--light-batch-size' && args[i + 1]) { LIGHT_BATCH_SIZE = parseInt(args[++i], 10) || 8; }
+  else if (args[i] === '--light-scroll-rounds' && args[i + 1]) { LIGHT_SCROLL_ROUNDS = parseInt(args[++i], 10) || 0; }
+  else if (args[i] === '--until-end') { LIGHT_UNTIL_END = true; }
+  else if (args[i] === '--rest-every' && args[i + 1]) { LIGHT_REST_EVERY = parseInt(args[++i], 10) || 0; }
+  else if (args[i] === '--rest-min-ms' && args[i + 1]) { LIGHT_REST_MIN_MS = parseInt(args[++i], 10) || 35000; }
+  else if (args[i] === '--rest-max-ms' && args[i + 1]) { LIGHT_REST_MAX_MS = parseInt(args[++i], 10) || 50000; }
+  else if (args[i] === '--user-subdir') { USER_SUBDIR = true; }
+  else if (args[i] === '--max-notes' && args[i + 1]) { MAX_NOTES = parseInt(args[++i], 10) || Infinity; MAX_NOTES_SPECIFIED = true; }
   else if (!PROFILE_URL) { PROFILE_URL = args[i]; }
   else if (!OUTPUT_DIR) { OUTPUT_DIR = path.resolve(args[i]); }
 }
 
+if (LIGHT_UNTIL_END && !MAX_NOTES_SPECIFIED) {
+  MAX_NOTES = Infinity;
+}
+
 if (!PROFILE_URL || !OUTPUT_DIR) {
-  console.error('Usage: node bulk-download.mjs <profile_url> <output_dir> [--chrome PATH] [--profile DIR] [--skip-login]');
+  console.error('Usage: node bulk-download.mjs <profile_url> <output_dir> [--chrome PATH] [--profile DIR] [--skip-login] [--mode normal|light]');
   console.error('Example: node bulk-download.mjs "https://xhslink.com/m/xxxxx" "./xhs_output" --skip-login');
+  process.exit(1);
+}
+
+if (!['normal', 'light'].includes(DOWNLOAD_MODE)) {
+  console.error(`Invalid --mode "${DOWNLOAD_MODE}". Use "normal" or "light".`);
   process.exit(1);
 }
 
@@ -120,6 +148,55 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const stamp = () => new Date().toLocaleTimeString();
 const log = (...args) => console.log(stamp(), ...args);
 const rand = (a, b) => a + Math.floor(Math.random() * (b - a)); // 反爬节奏：随机区间 [a, b)
+
+function readJson(file, fallback) {
+  try {
+    if (!fs.existsSync(file)) return fallback;
+    return JSON.parse(fs.readFileSync(file, 'utf-8'));
+  } catch(e) {
+    return fallback;
+  }
+}
+
+function writeJson(file, value) {
+  try {
+    fs.writeFileSync(file, JSON.stringify(value, null, 2));
+  } catch(e) {}
+}
+
+function isRiskText(text, url = '') {
+  return /300013|安全限制|访问频繁|访问异常|操作过于频繁|请勿频繁操作|请稍后再试|安全验证|验证码|滑动验证|拼图|captcha|verify/i.test(text || '')
+    || /error_code=|\/captcha|\/sec_|verify/i.test(url || '');
+}
+
+function sanitizePathPart(value, fallback = 'unknown-user') {
+  const cleaned = String(value || '')
+    .replace(/\s*-\s*小红书\s*$/i, '')
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+    .trim();
+  return cleaned || fallback;
+}
+
+async function profileDisplayName(page, uid) {
+  try {
+    const fromTitle = sanitizePathPart(await page.title(), '');
+    if (fromTitle) return fromTitle;
+  } catch(e) {}
+  try {
+    const fromDom = await page.evaluate(() => {
+      const candidates = [
+        document.querySelector('.user-name')?.textContent,
+        document.querySelector('[class*="user-name"]')?.textContent,
+        document.querySelector('[class*="nickname"]')?.textContent,
+        document.querySelector('h1')?.textContent,
+      ];
+      return candidates.find(Boolean) || '';
+    });
+    const cleaned = sanitizePathPart(fromDom, '');
+    if (cleaned) return cleaned;
+  } catch(e) {}
+  return uid;
+}
 
 async function isLoggedIn(page) {
   // 多维度检测登录态：INITIAL_STATE 不可靠（首页经常未填充），
@@ -245,6 +322,291 @@ async function extractXsec(page) {
   });
 }
 
+async function extractVisibleXsec(page) {
+  return await page.evaluate(() => {
+    const m = {};
+    document.querySelectorAll('section.note-item a, a[href*="/user/profile/"]').forEach(a => {
+      const rect = a.getBoundingClientRect();
+      if (rect.width < 20 || rect.height < 20 || rect.bottom < 0 || rect.top > window.innerHeight) return;
+      const h = a.getAttribute('href') || a.href || '';
+      const x = h.match(/\/user\/profile\/[^/]+\/([a-f0-9]{24})\?xsec_token=([^&]+)&/);
+      if (x) m[x[1]] = x[2];
+    });
+    return m;
+  });
+}
+
+async function scrollOneViewport(page) {
+  return await page.evaluate(() => {
+    const before = window.scrollY;
+    const delta = Math.floor(window.innerHeight * 0.82);
+    window.scrollBy(0, delta);
+    return {
+      before,
+      afterTarget: before + delta,
+      height: document.documentElement.scrollHeight,
+      innerHeight: window.innerHeight,
+    };
+  });
+}
+
+async function pagePosition(page) {
+  return await page.evaluate(() => ({
+    scrollY: window.scrollY,
+    height: document.documentElement.scrollHeight,
+    innerHeight: window.innerHeight,
+    atBottom: window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 4,
+  })).catch(() => ({ scrollY: 0, height: 0, innerHeight: 0, atBottom: false }));
+}
+
+function parseInitialState(html) {
+  const match = String(html || '').match(/<script>window\.__INITIAL_STATE__=(.*?)<\/script>/s);
+  if (!match) return null;
+  const context = { window: {} };
+  try {
+    vm.runInNewContext(`window.__INITIAL_STATE__=${match[1]}`, context, { timeout: 1000 });
+    return context.window.__INITIAL_STATE__;
+  } catch(e) {
+    return null;
+  }
+}
+
+function pickImageUrl(image) {
+  if (!image) return '';
+  return image.urlDefault
+    || image.urlPre
+    || image.url
+    || image.infoList?.find(item => item.imageScene === 'WB_DFT')?.url
+    || image.infoList?.[0]?.url
+    || '';
+}
+
+async function cookieHeaderFromPage(page) {
+  try {
+    const cookies = await page.cookies('https://www.xiaohongshu.com');
+    return cookies.map(c => `${c.name}=${c.value}`).join('; ');
+  } catch(e) {
+    return '';
+  }
+}
+
+async function fetchWithRetry(url, options = {}, attempts = 2) {
+  let lastError = null;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await fetch(url, options);
+      if (res.ok || i === attempts - 1) return res;
+      lastError = new Error(`HTTP ${res.status}`);
+    } catch(e) {
+      lastError = e;
+    }
+    await sleep(rand(1200, 2600));
+  }
+  throw lastError || new Error('fetch failed');
+}
+
+async function fetchText(url, cookieHeader = '') {
+  const headers = {
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Referer': PROFILE_URL,
+    'User-Agent': 'Mozilla/5.0',
+  };
+  if (cookieHeader) headers.Cookie = cookieHeader;
+  const res = await fetchWithRetry(url, { headers }, 2);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return await res.text();
+}
+
+async function fetchImageBytes(url, referer, cookieHeader = '') {
+  const headers = {
+    'Referer': referer || 'https://www.xiaohongshu.com/',
+    'User-Agent': 'Mozilla/5.0',
+  };
+  if (cookieHeader) headers.Cookie = cookieHeader;
+  const res = await fetchWithRetry(url, { headers }, 2);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return Buffer.from(await res.arrayBuffer());
+}
+
+async function downloadNoteLight(noteId, xsec, uid, outputDir, cookieHeader) {
+  const noteUrl = xsec
+    ? `https://www.xiaohongshu.com/user/profile/${uid}/${noteId}?xsec_token=${encodeURIComponent(xsec)}&xsec_source=pc_user`
+    : `https://www.xiaohongshu.com/explore/${noteId}`;
+  const rec = {
+    runAt: new Date().toISOString(),
+    source: 'puppeteer-visible-light',
+    noteId,
+    href: noteUrl,
+    ok: false,
+    images: 0,
+    files: [],
+  };
+
+  let html;
+  try {
+    html = await fetchText(noteUrl, cookieHeader);
+  } catch(e) {
+    rec.error = `detail fetch failed: ${e.message}`;
+    return rec;
+  }
+
+  if (isRiskText(html.slice(0, 2000), noteUrl)) {
+    rec.risk = true;
+    rec.error = 'risk text detected';
+    return rec;
+  }
+
+  const state = parseInitialState(html);
+  const detailMap = state?.note?.noteDetailMap || {};
+  const detail = detailMap[noteId]?.note
+    || Object.values(detailMap).find(item => item?.note?.noteId === noteId)?.note
+    || null;
+  if (!detail) {
+    rec.error = 'detail state not found';
+    return rec;
+  }
+
+  const imgs = [...new Set((detail.imageList || []).map(pickImageUrl).filter(Boolean))];
+  rec.title = detail.title || '';
+  rec.type = detail.type || '';
+  rec.imageUrlCount = imgs.length;
+  const pref = noteId.slice(0, 8);
+
+  for (let j = 0; j < imgs.length; j++) {
+    const imgUrl = imgs[j].replace(/^http:/, 'https:');
+    const fp = path.join(outputDir, `${pref}_${(j+1).toString().padStart(2,'0')}.webp`);
+    if (fs.existsSync(fp) && fs.statSync(fp).size > 5000) {
+      rec.files.push({ file: fp, bytes: fs.statSync(fp).size, skipped: true });
+      continue;
+    }
+
+    try {
+      const buf = await fetchImageBytes(imgUrl, noteUrl, cookieHeader);
+      if (buf.length > 5000) {
+        fs.writeFileSync(fp, buf);
+        rec.files.push({ file: fp, bytes: buf.length });
+      } else {
+        rec.files.push({ file: fp, error: `too small ${buf.length}` });
+      }
+    } catch(e) {
+      rec.files.push({ file: fp, error: e.message });
+    }
+  }
+
+  rec.images = rec.files.filter(file => file.bytes).length;
+  rec.ok = rec.images > 0 || imgs.length === 0;
+  return rec;
+}
+
+async function runLightMode(page, uid) {
+  const xsecCacheFile = path.join(OUTPUT_DIR, '.xhs-xsec-cache.json');
+  const attemptedFile = path.join(OUTPUT_DIR, '.xhs-attempted.json');
+  const manifestFile = path.join(OUTPUT_DIR, 'manifest-light.json');
+  const xsecMap = readJson(xsecCacheFile, {});
+  const manifest = readJson(manifestFile, []);
+  const saved = new Set(
+    fs.readdirSync(OUTPUT_DIR)
+      .filter(f => /^[0-9a-f]+_\d+\.webp$/.test(f))
+      .map(f => f.split('_')[0])
+  );
+  const completed = new Set(saved);
+  manifest.filter(item => item?.ok && item?.noteId).forEach(item => {
+    completed.add(item.noteId);
+    completed.add(item.noteId.slice(0, 8));
+  });
+
+  log('Light mode: visible batch discovery + SSR detail download');
+  log(`Light batch size: ${LIGHT_BATCH_SIZE}; max notes: ${MAX_NOTES}; scroll rounds: ${LIGHT_UNTIL_END ? 'until end' : LIGHT_SCROLL_ROUNDS}`);
+  log(`Rest policy: every ${LIGHT_REST_EVERY || 'never'} scrolls, ${Math.round(LIGHT_REST_MIN_MS / 1000)}-${Math.round(LIGHT_REST_MAX_MS / 1000)}s`);
+
+  let processed = 0;
+  let total = 0;
+  let scrollRounds = 0;
+  let noNewRounds = 0;
+  const maxScrollRounds = LIGHT_UNTIL_END ? Infinity : LIGHT_SCROLL_ROUNDS;
+
+  while (processed < MAX_NOTES) {
+    const riskState = await page.evaluate(() => ({
+      text: ((document.body && document.body.innerText) || '').slice(0, 800),
+      url: window.location.href,
+    })).catch(() => ({ text: '', url: page.url() }));
+    if (isRiskText(riskState.text, riskState.url)) {
+      log('⚠️ 发现风控/验证提示，轻量模式停止。建议休息后再继续，已下载内容会断点跳过。');
+      break;
+    }
+
+    const visibleMap = await extractVisibleXsec(page);
+    Object.assign(xsecMap, visibleMap);
+    writeJson(xsecCacheFile, xsecMap);
+
+    const candidates = Object.entries(visibleMap)
+      .filter(([nid]) => !completed.has(nid) && !completed.has(nid.slice(0, 8)));
+    if (candidates.length > 0) {
+      const cookieHeader = await cookieHeaderFromPage(page);
+      const pending = candidates.slice(0, MAX_NOTES - processed);
+      log(`Visible candidates: ${candidates.length}; downloading up to ${pending.length} before next scroll`);
+      noNewRounds = 0;
+
+      while (pending.length > 0 && processed < MAX_NOTES) {
+        const batch = pending.splice(0, LIGHT_BATCH_SIZE);
+        for (let i = 0; i < batch.length; i++) {
+          const [nid, xsec] = batch[i];
+          log(`[light ${processed + 1}/${MAX_NOTES}] ${nid.slice(0, 8)}`);
+          const rec = await downloadNoteLight(nid, xsec, uid, OUTPUT_DIR, cookieHeader);
+          processed++;
+
+          manifest.push(rec);
+          writeJson(manifestFile, manifest);
+
+          if (rec.risk) {
+            log('⚠️ 详情页 SSR 返回风控/验证内容，轻量模式停止。');
+            return total;
+          }
+
+          if (rec.ok) {
+            completed.add(nid);
+            completed.add(nid.slice(0, 8));
+            writeJson(attemptedFile, [...completed].filter(n => n.length === 8));
+            total += rec.images;
+            log(`  → ${rec.images} images (total: ${total})`);
+          } else {
+            log(`  → failed: ${rec.error || 'unknown error'} (will retry if visible again)`);
+          }
+
+          if ((i < batch.length - 1 || pending.length > 0) && processed < MAX_NOTES) {
+            await sleep(rand(4000, 9000));
+          }
+        }
+      }
+    } else {
+      log('No new visible notes in current viewport.');
+      noNewRounds++;
+    }
+
+    const posBeforeScroll = await pagePosition(page);
+    if (processed >= MAX_NOTES || scrollRounds >= maxScrollRounds || posBeforeScroll.atBottom) break;
+    if (noNewRounds >= 3) {
+      log('No new notes for 3 consecutive viewports; stopping to avoid an idle loop.');
+      break;
+    }
+
+    await scrollOneViewport(page);
+    scrollRounds++;
+    await sleep(rand(3000, 6000));
+
+    if (LIGHT_REST_EVERY > 0 && scrollRounds % LIGHT_REST_EVERY === 0 && processed < MAX_NOTES) {
+      const restMs = rand(LIGHT_REST_MIN_MS, LIGHT_REST_MAX_MS);
+      log(`  🍵 ${scrollRounds} scrolls completed, resting ${Math.round(restMs / 1000)}s...`);
+      await sleep(restMs);
+    }
+  }
+
+  log(`\nLight mode done! Downloaded ${total} images in this run.`);
+  const all = fs.readdirSync(OUTPUT_DIR).filter(f => /^[0-9a-f]+_\d+\.webp$/.test(f));
+  log(`Directory now has ${all.length} images across ${new Set(all.map(f => f.split('_')[0])).size} note prefixes.`);
+  return total;
+}
+
 // 返回值：>=0 = 本篇成功下载的图片数；-1 = 检测到风控，主循环应立即停止
 async function downloadNote(page, noteId, xsec, uid, outputDir) {
   const url = xsec
@@ -316,6 +678,8 @@ async function main() {
   log(`Chrome:      ${CHROME_PATH}`);
   log(`Profile:     ${USER_DATA_DIR}`);
   log(`Skip login:  ${SKIP_LOGIN}`);
+  log(`Max notes:   ${MAX_NOTES}`);
+  log(`Mode:        ${DOWNLOAD_MODE}`);
 
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
@@ -347,11 +711,31 @@ async function main() {
   try {
     if (!await ensureLogin(page)) { await browser.close(); process.exit(1); }
 
+    if (USER_SUBDIR) {
+      const name = await profileDisplayName(page, uid);
+      const currentBase = sanitizePathPart(path.basename(OUTPUT_DIR), '');
+      if (currentBase !== name) OUTPUT_DIR = path.join(OUTPUT_DIR, name);
+      fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+      writeJson(path.join(OUTPUT_DIR, '.xhs-profile.json'), {
+        uid,
+        name,
+        profileUrl: PROFILE_URL,
+        updatedAt: new Date().toISOString(),
+      });
+      log(`User subdir:  ${name}`);
+      log(`Output final: ${OUTPUT_DIR}`);
+    }
+
     // ensureLogin already navigated to profile page and verified xsec
     if (page.url().includes('error_code=300012')) {
       log('IP BLOCKED! xsec_token may be expired. Get a fresh share link.');
       await browser.close();
       process.exit(1);
+    }
+
+    if (DOWNLOAD_MODE === 'light') {
+      await runLightMode(page, uid);
+      return;
     }
 
     // ── xsec 缓存：优先用上次滚动的结果，跳过滚动阶段 ──

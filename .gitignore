@@ -1,5 +1,6 @@
 node_modules/
 output/
+xhs_downloads/
 *.webp
 .DS_Store
 Thumbs.db
