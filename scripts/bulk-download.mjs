@@ -19,7 +19,6 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import vm from 'node:vm';
 
 // ──────────────── Config ────────────────
 const args = process.argv.slice(2);
@@ -164,9 +163,29 @@ function writeJson(file, value) {
   } catch(e) {}
 }
 
+function readManifestRecords(file) {
+  if (!fs.existsSync(file)) return [];
+  try {
+    const text = fs.readFileSync(file, 'utf-8').trim();
+    if (!text) return [];
+    if (text.startsWith('[')) return JSON.parse(text);
+    return text.split(/\r?\n/)
+      .filter(Boolean)
+      .map(line => JSON.parse(line));
+  } catch(e) {
+    return [];
+  }
+}
+
+function appendManifestRecord(file, value) {
+  try {
+    fs.appendFileSync(file, `${JSON.stringify(value)}\n`);
+  } catch(e) {}
+}
+
 function isRiskText(text, url = '') {
-  return /300013|安全限制|访问频繁|访问异常|操作过于频繁|请勿频繁操作|请稍后再试|安全验证|验证码|滑动验证|拼图|captcha|verify/i.test(text || '')
-    || /error_code=|\/captcha|\/sec_|verify/i.test(url || '');
+  return /300013|安全限制|访问频繁|访问异常|操作过于频繁|请勿频繁操作|请稍后再试|安全验证/i.test(text || '')
+    || /error_code=300013/i.test(url || '');
 }
 
 function sanitizePathPart(value, fallback = 'unknown-user') {
@@ -295,7 +314,7 @@ async function patientScroll(page) {
     blocked = await page.evaluate(() => {
       const t = ((document.body && document.body.innerText) || '').slice(0, 200);
       return /安全验证|访问频繁|操作过于频繁|访问异常/.test(t)
-        || /error_code=/.test(window.location.href);
+        || /error_code=300013/.test(window.location.href);
     });
     if (blocked) { log('  ⚠️ 滚动中触发风控，停止翻页'); break; }
     const before = Object.keys(xsecMap).length;
@@ -359,18 +378,6 @@ async function pagePosition(page) {
   })).catch(() => ({ scrollY: 0, height: 0, innerHeight: 0, atBottom: false }));
 }
 
-function parseInitialState(html) {
-  const match = String(html || '').match(/<script>window\.__INITIAL_STATE__=(.*?)<\/script>/s);
-  if (!match) return null;
-  const context = { window: {} };
-  try {
-    vm.runInNewContext(`window.__INITIAL_STATE__=${match[1]}`, context, { timeout: 1000 });
-    return context.window.__INITIAL_STATE__;
-  } catch(e) {
-    return null;
-  }
-}
-
 function pickImageUrl(image) {
   if (!image) return '';
   return image.urlDefault
@@ -381,54 +388,78 @@ function pickImageUrl(image) {
     || '';
 }
 
-async function cookieHeaderFromPage(page) {
-  try {
-    const cookies = await page.cookies('https://www.xiaohongshu.com');
-    return cookies.map(c => `${c.name}=${c.value}`).join('; ');
-  } catch(e) {
-    return '';
-  }
-}
-
-async function fetchWithRetry(url, options = {}, attempts = 2) {
-  let lastError = null;
-  for (let i = 0; i < attempts; i++) {
+async function fetchDetailStateInPage(page, noteUrl, noteId) {
+  return await page.evaluate(async ({ url, noteId }) => {
+    const result = { ok: false, status: 0, url, note: null, error: '', riskText: false };
+    const riskRe = /300013|安全限制|访问频繁|访问异常|操作过于频繁|请勿频繁操作|请稍后再试|安全验证/i;
     try {
-      const res = await fetch(url, options);
-      if (res.ok || i === attempts - 1) return res;
-      lastError = new Error(`HTTP ${res.status}`);
+      const res = await fetch(url, {
+        credentials: 'include',
+        headers: { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' },
+      });
+      result.status = res.status;
+      result.url = res.url || url;
+      const html = await res.text();
+      result.riskText = riskRe.test(html) || /error_code=300013/i.test(result.url);
+      if (!res.ok) {
+        result.error = `detail HTTP ${res.status}`;
+        return result;
+      }
+      if (result.riskText) {
+        result.error = 'risk text detected';
+        return result;
+      }
+
+      const match = html.match(/<script>window\.__INITIAL_STATE__=(.*?)<\/script>/s);
+      if (!match) {
+        result.error = 'initial state script not found';
+        return result;
+      }
+      let state;
+      try {
+        state = JSON.parse(match[1].replace(/undefined/g, 'null'));
+      } catch(e) {
+        result.error = `initial state JSON parse failed: ${e.message}`;
+        return result;
+      }
+      const detailMap = state?.note?.noteDetailMap || {};
+      const detail = detailMap[noteId]?.note
+        || Object.values(detailMap).find(item => item?.note?.noteId === noteId)?.note
+        || null;
+      if (!detail) {
+        result.error = 'detail state not found';
+        return result;
+      }
+      result.ok = true;
+      result.note = detail;
+      return result;
     } catch(e) {
-      lastError = e;
+      result.error = e?.message || String(e);
+      return result;
     }
-    await sleep(rand(1200, 2600));
-  }
-  throw lastError || new Error('fetch failed');
+  }, { url: noteUrl, noteId });
 }
 
-async function fetchText(url, cookieHeader = '') {
-  const headers = {
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Referer': PROFILE_URL,
-    'User-Agent': 'Mozilla/5.0',
-  };
-  if (cookieHeader) headers.Cookie = cookieHeader;
-  const res = await fetchWithRetry(url, { headers }, 2);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return await res.text();
+async function fetchImageBase64InPage(page, imgUrl) {
+  return await page.evaluate(async (url) => {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) return { ok: false, error: `image HTTP ${res.status}` };
+      const blob = await res.blob();
+      const b64 = await new Promise(resolve => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve((reader.result || '').toString().split(',')[1] || '');
+        reader.onerror = () => resolve('');
+        reader.readAsDataURL(blob);
+      });
+      return { ok: !!b64, b64, bytes: blob.size };
+    } catch(e) {
+      return { ok: false, error: e?.message || String(e) };
+    }
+  }, imgUrl);
 }
 
-async function fetchImageBytes(url, referer, cookieHeader = '') {
-  const headers = {
-    'Referer': referer || 'https://www.xiaohongshu.com/',
-    'User-Agent': 'Mozilla/5.0',
-  };
-  if (cookieHeader) headers.Cookie = cookieHeader;
-  const res = await fetchWithRetry(url, { headers }, 2);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return Buffer.from(await res.arrayBuffer());
-}
-
-async function downloadNoteLight(noteId, xsec, uid, outputDir, cookieHeader) {
+async function downloadNoteLight(page, noteId, xsec, uid, outputDir) {
   const noteUrl = xsec
     ? `https://www.xiaohongshu.com/user/profile/${uid}/${noteId}?xsec_token=${encodeURIComponent(xsec)}&xsec_source=pc_user`
     : `https://www.xiaohongshu.com/explore/${noteId}`;
@@ -438,38 +469,36 @@ async function downloadNoteLight(noteId, xsec, uid, outputDir, cookieHeader) {
     noteId,
     href: noteUrl,
     ok: false,
+    kind: 'unknown',
     images: 0,
     files: [],
   };
 
-  let html;
-  try {
-    html = await fetchText(noteUrl, cookieHeader);
-  } catch(e) {
-    rec.error = `detail fetch failed: ${e.message}`;
-    return rec;
-  }
-
-  if (isRiskText(html.slice(0, 2000), noteUrl)) {
+  const detailResult = await fetchDetailStateInPage(page, noteUrl, noteId);
+  if (detailResult.riskText || isRiskText('', detailResult.url)) {
     rec.risk = true;
-    rec.error = 'risk text detected';
+    rec.kind = 'risk';
+    rec.error = detailResult.error || 'risk text detected';
+    return rec;
+  }
+  if (!detailResult.ok) {
+    rec.kind = 'detail_failed';
+    rec.error = detailResult.error || 'detail fetch failed';
+    rec.detailStatus = detailResult.status;
     return rec;
   }
 
-  const state = parseInitialState(html);
-  const detailMap = state?.note?.noteDetailMap || {};
-  const detail = detailMap[noteId]?.note
-    || Object.values(detailMap).find(item => item?.note?.noteId === noteId)?.note
-    || null;
-  if (!detail) {
-    rec.error = 'detail state not found';
-    return rec;
-  }
-
+  const detail = detailResult.note;
   const imgs = [...new Set((detail.imageList || []).map(pickImageUrl).filter(Boolean))];
   rec.title = detail.title || '';
   rec.type = detail.type || '';
   rec.imageUrlCount = imgs.length;
+  if (imgs.length === 0) {
+    rec.ok = true;
+    rec.kind = 'text';
+    return rec;
+  }
+
   const pref = noteId.slice(0, 8);
 
   for (let j = 0; j < imgs.length; j++) {
@@ -481,12 +510,17 @@ async function downloadNoteLight(noteId, xsec, uid, outputDir, cookieHeader) {
     }
 
     try {
-      const buf = await fetchImageBytes(imgUrl, noteUrl, cookieHeader);
-      if (buf.length > 5000) {
+      const fetched = await fetchImageBase64InPage(page, imgUrl);
+      if (fetched.ok && fetched.b64) {
+        const buf = Buffer.from(fetched.b64, 'base64');
+        if (buf.length <= 5000) {
+          rec.files.push({ file: fp, error: `too small ${buf.length}` });
+          continue;
+        }
         fs.writeFileSync(fp, buf);
         rec.files.push({ file: fp, bytes: buf.length });
       } else {
-        rec.files.push({ file: fp, error: `too small ${buf.length}` });
+        rec.files.push({ file: fp, error: fetched.error || 'image fetch failed' });
       }
     } catch(e) {
       rec.files.push({ file: fp, error: e.message });
@@ -494,16 +528,22 @@ async function downloadNoteLight(noteId, xsec, uid, outputDir, cookieHeader) {
   }
 
   rec.images = rec.files.filter(file => file.bytes).length;
-  rec.ok = rec.images > 0 || imgs.length === 0;
+  rec.ok = rec.images > 0;
+  rec.kind = rec.ok ? 'image' : 'image_failed';
+  if (!rec.ok) rec.error = 'all image downloads failed';
   return rec;
 }
 
 async function runLightMode(page, uid) {
   const xsecCacheFile = path.join(OUTPUT_DIR, '.xhs-xsec-cache.json');
   const attemptedFile = path.join(OUTPUT_DIR, '.xhs-attempted.json');
-  const manifestFile = path.join(OUTPUT_DIR, 'manifest-light.json');
+  const oldManifestFile = path.join(OUTPUT_DIR, 'manifest-light.json');
+  const manifestFile = path.join(OUTPUT_DIR, 'manifest-light.jsonl');
   const xsecMap = readJson(xsecCacheFile, {});
-  const manifest = readJson(manifestFile, []);
+  const manifest = [
+    ...readManifestRecords(oldManifestFile),
+    ...readManifestRecords(manifestFile),
+  ];
   const saved = new Set(
     fs.readdirSync(OUTPUT_DIR)
       .filter(f => /^[0-9a-f]+_\d+\.webp$/.test(f))
@@ -515,12 +555,13 @@ async function runLightMode(page, uid) {
     completed.add(item.noteId.slice(0, 8));
   });
 
-  log('Light mode: visible batch discovery + SSR detail download');
+  log('Light mode: visible batch discovery + page-context detail/image fetch');
   log(`Light batch size: ${LIGHT_BATCH_SIZE}; max notes: ${MAX_NOTES}; scroll rounds: ${LIGHT_UNTIL_END ? 'until end' : LIGHT_SCROLL_ROUNDS}`);
   log(`Rest policy: every ${LIGHT_REST_EVERY || 'never'} scrolls, ${Math.round(LIGHT_REST_MIN_MS / 1000)}-${Math.round(LIGHT_REST_MAX_MS / 1000)}s`);
 
   let processed = 0;
   let total = 0;
+  const kindCounts = new Map();
   let scrollRounds = 0;
   let noNewRounds = 0;
   const maxScrollRounds = LIGHT_UNTIL_END ? Infinity : LIGHT_SCROLL_ROUNDS;
@@ -542,7 +583,6 @@ async function runLightMode(page, uid) {
     const candidates = Object.entries(visibleMap)
       .filter(([nid]) => !completed.has(nid) && !completed.has(nid.slice(0, 8)));
     if (candidates.length > 0) {
-      const cookieHeader = await cookieHeaderFromPage(page);
       const pending = candidates.slice(0, MAX_NOTES - processed);
       log(`Visible candidates: ${candidates.length}; downloading up to ${pending.length} before next scroll`);
       noNewRounds = 0;
@@ -552,14 +592,14 @@ async function runLightMode(page, uid) {
         for (let i = 0; i < batch.length; i++) {
           const [nid, xsec] = batch[i];
           log(`[light ${processed + 1}/${MAX_NOTES}] ${nid.slice(0, 8)}`);
-          const rec = await downloadNoteLight(nid, xsec, uid, OUTPUT_DIR, cookieHeader);
+          const rec = await downloadNoteLight(page, nid, xsec, uid, OUTPUT_DIR);
           processed++;
+          kindCounts.set(rec.kind || 'unknown', (kindCounts.get(rec.kind || 'unknown') || 0) + 1);
 
-          manifest.push(rec);
-          writeJson(manifestFile, manifest);
+          appendManifestRecord(manifestFile, rec);
 
           if (rec.risk) {
-            log('⚠️ 详情页 SSR 返回风控/验证内容，轻量模式停止。');
+            log('⚠️ 页面内详情请求返回风控内容，轻量模式停止。');
             return total;
           }
 
@@ -568,9 +608,9 @@ async function runLightMode(page, uid) {
             completed.add(nid.slice(0, 8));
             writeJson(attemptedFile, [...completed].filter(n => n.length === 8));
             total += rec.images;
-            log(`  → ${rec.images} images (total: ${total})`);
+            log(`  → ${rec.images} images, ${rec.kind} (total: ${total})`);
           } else {
-            log(`  → failed: ${rec.error || 'unknown error'} (will retry if visible again)`);
+            log(`  → failed: ${rec.kind || 'unknown'}: ${rec.error || 'unknown error'} (will retry if visible again)`);
           }
 
           if ((i < batch.length - 1 || pending.length > 0) && processed < MAX_NOTES) {
@@ -602,6 +642,9 @@ async function runLightMode(page, uid) {
   }
 
   log(`\nLight mode done! Downloaded ${total} images in this run.`);
+  if (kindCounts.size > 0) {
+    log(`Light result kinds: ${[...kindCounts.entries()].map(([kind, count]) => `${kind}=${count}`).join(', ')}`);
+  }
   const all = fs.readdirSync(OUTPUT_DIR).filter(f => /^[0-9a-f]+_\d+\.webp$/.test(f));
   log(`Directory now has ${all.length} images across ${new Set(all.map(f => f.split('_')[0])).size} note prefixes.`);
   return total;
@@ -624,10 +667,9 @@ async function downloadNote(page, noteId, xsec, uid, outputDir) {
   // 风控检测：撞到验证/频繁提示就停（实测 XHS 会显示 "安全验证" / "请勿频繁操作" / "访问频繁"）
   const blocked = await page.evaluate(() => {
     const t = ((document.body && document.body.innerText) || '').slice(0, 300);
-    if (/安全验证|请勿频繁操作|操作过于频繁|访问异常|验证码|访问频繁/.test(t)) return true;
-    if (/\/captcha|\/sec_/.test(window.location.href)) return true;
-    if (/error_code=/.test(window.location.href)) return true;
-    return !!document.querySelector('.captcha, [class*="captcha"], [class*="verify-"]');
+    if (/安全验证|安全限制|请勿频繁操作|操作过于频繁|访问异常|访问频繁|请稍后再试/.test(t)) return true;
+    if (/error_code=300013/.test(window.location.href)) return true;
+    return false;
   });
   if (blocked) return -1;
 

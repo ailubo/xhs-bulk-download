@@ -12,7 +12,7 @@
 - ✅ 反爬节奏——笔记间随机停顿 + 每 40 篇分批休息 + 撞风控自动停（保护账号）
 - ✅ 高效下载——拦截无关资源 + `domcontentloaded` + base64 回传，少下约一半网络
 - ✅ 绕过 CDN 防盗链——浏览器内 fetch 带正确 Referer
-- ✅ 轻量模式——浏览器只发现当前可见笔记，详情页用 SSR 解析下载，减少连续详情页浏览行为
+- ✅ 轻量模式——浏览器只发现当前可见笔记，详情页和图片用页面内 fetch 下载，减少连续详情页浏览行为
 
 ## 安装
 
@@ -38,7 +38,7 @@ node scripts/bulk-download.mjs <profile_url> <output_dir> [--skip-login] [--mode
 | `--profile <dir>` | 否 | Chrome 用户数据目录（默认系统临时目录） |
 | `--skip-login` | 否 | 跳过登录等待（已登录时使用） |
 | `--max-notes <n>` | 否 | 本次最多处理 n 篇笔记后停止（分批下载，配合断点续传） |
-| `--mode <normal\|light>` | 否 | 下载模式：`normal` 为原浏览器详情页下载；`light` 为分批发现 + SSR 轻量下载 |
+| `--mode <normal\|light>` | 否 | 下载模式：`normal` 为原浏览器详情页下载；`light` 为分批发现 + 页面内 fetch 轻量下载 |
 | `--light` | 否 | `--mode light` 的快捷写法 |
 | `--light-batch-size <n>` | 否 | 轻量模式处理当前视口时，每个下载子批次最多 n 篇（默认 8） |
 | `--light-scroll-rounds <n>` | 否 | 轻量模式最多滚动发现 n 轮（默认 30） |
@@ -82,8 +82,8 @@ node scripts/bulk-download.mjs "https://xhslink.com/m/xxxxx" "./output" --chrome
 3. 可选：用页面标题识别用户名，保存到 output_dir/用户名
 4. 读取当前可见卡片的 noteId + xsec_token，并写入缓存
 5. 先下载当前可见批次，完成后再滚动下一屏
-6. 用 Node 侧 SSR 请求解析笔记详情页 __INITIAL_STATE__.noteDetailMap.imageList
-7. 写入 manifest-light.json；只有成功记录才算断点完成，短暂 fetch failed 会在下一次可见时重试
+6. 用页面内 fetch 请求详情页，并从 __INITIAL_STATE__.noteDetailMap.imageList 解析图片
+7. 追加写入 manifest-light.jsonl；只有 ok=true 的记录才算断点完成，短暂 fetch failed 会在下一次可见时重试
 8. 每滚动 3 次休息一段时间，直到到达页面底部或达到 --max-notes / --light-scroll-rounds
 ```
 
@@ -98,7 +98,7 @@ node scripts/bulk-download.mjs "https://xhslink.com/m/xxxxx" "./output" --chrome
    如果用了默认临时 profile，需要先扫码登录；更稳的方式是用 --profile 指向一个专用持久目录。
 
 2. 失败不能记成已完成。
-   旧逻辑如果把 fetch failed 写入 attempted，下次会跳过失败笔记；现在 manifest-light.json 只把 ok=true 作为完成依据。
+   旧逻辑如果把 fetch failed 写入 attempted，下次会跳过失败笔记；现在 manifest-light.jsonl 只把 ok=true 作为完成依据。
 
 3. 不同账号必须分目录。
    推荐用 --user-subdir，把图片保存到 xhs_downloads/用户名/，不要把多个博主混到一个目录。
@@ -115,7 +115,8 @@ node scripts/bulk-download.mjs "https://xhslink.com/m/xxxxx" "./output" --chrome
 - 文件命名：`{noteId前8位}_{序号}.webp`
 - 格式：WebP（小红书 CDN 默认格式）
 - 已下载自动跳过，支持断点续传
-- 轻量模式记录：`manifest-light.json`
+- 轻量模式记录：`manifest-light.jsonl`（append-only JSONL）
+- 旧版 `manifest-light.json` 仍会被读取用于断点判断，新记录只追加到 JSONL
 - 如果使用 `--user-subdir`：`<output_dir>/<用户名>/*.webp`
 
 ## 已知限制
