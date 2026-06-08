@@ -184,7 +184,7 @@ function appendManifestRecord(file, value) {
 }
 
 function isRiskText(text, url = '') {
-  return /300013|安全限制|访问频繁|访问异常|操作过于频繁|请勿频繁操作|请稍后再试|安全验证/i.test(text || '')
+  return /300013|安全限制|访问频繁|访问异常|操作过于频繁|请勿频繁操作|请稍后再试/i.test(text || '')
     || /error_code=300013/i.test(url || '');
 }
 
@@ -313,7 +313,7 @@ async function patientScroll(page) {
     // 滚动过程中检测风控
     blocked = await page.evaluate(() => {
       const t = ((document.body && document.body.innerText) || '').slice(0, 200);
-      return /安全验证|访问频繁|操作过于频繁|访问异常/.test(t)
+      return /安全限制|访问频繁|操作过于频繁|访问异常|请勿频繁操作|请稍后再试/.test(t)
         || /error_code=300013/.test(window.location.href);
     });
     if (blocked) { log('  ⚠️ 滚动中触发风控，停止翻页'); break; }
@@ -369,6 +369,14 @@ async function scrollOneViewport(page) {
   });
 }
 
+async function settleAfterLightScroll(page) {
+  await sleep(rand(1200, 2400));
+  await page.evaluate(() => window.scrollBy(0, -Math.floor(window.innerHeight * 0.12))).catch(() => {});
+  await sleep(rand(700, 1400));
+  await page.evaluate(() => window.scrollBy(0, Math.floor(window.innerHeight * 0.12))).catch(() => {});
+  await sleep(rand(1400, 2600));
+}
+
 async function pagePosition(page) {
   return await page.evaluate(() => ({
     scrollY: window.scrollY,
@@ -391,7 +399,7 @@ function pickImageUrl(image) {
 async function fetchDetailStateInPage(page, noteUrl, noteId) {
   return await page.evaluate(async ({ url, noteId }) => {
     const result = { ok: false, status: 0, url, note: null, error: '', riskText: false };
-    const riskRe = /300013|安全限制|访问频繁|访问异常|操作过于频繁|请勿频繁操作|请稍后再试|安全验证/i;
+    const riskRe = /300013|安全限制|访问频繁|访问异常|操作过于频繁|请勿频繁操作|请稍后再试/i;
     try {
       const res = await fetch(url, {
         credentials: 'include',
@@ -410,7 +418,11 @@ async function fetchDetailStateInPage(page, noteUrl, noteId) {
         return result;
       }
 
-      const match = html.match(/<script>window\.__INITIAL_STATE__=(.*?)<\/script>/s);
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const stateScript = Array.from(doc.scripts)
+        .map(script => script.textContent || '')
+        .find(text => /window\.__INITIAL_STATE__\s*=/.test(text));
+      const match = stateScript?.match(/window\.__INITIAL_STATE__\s*=\s*(.*)$/s);
       if (!match) {
         result.error = 'initial state script not found';
         return result;
@@ -528,6 +540,8 @@ async function downloadNoteLight(page, noteId, xsec, uid, outputDir) {
   }
 
   rec.images = rec.files.filter(file => file.bytes).length;
+  rec.imageFetchFailures = rec.files.filter(file => file.error).length;
+  rec.image403 = rec.files.filter(file => /HTTP 403/i.test(file.error || '')).length;
   rec.ok = rec.images > 0;
   rec.kind = rec.ok ? 'image' : 'image_failed';
   if (!rec.ok) rec.error = 'all image downloads failed';
@@ -540,6 +554,7 @@ async function runLightMode(page, uid) {
   const oldManifestFile = path.join(OUTPUT_DIR, 'manifest-light.json');
   const manifestFile = path.join(OUTPUT_DIR, 'manifest-light.jsonl');
   const xsecMap = readJson(xsecCacheFile, {});
+  const attempted = readJson(attemptedFile, []);
   const manifest = [
     ...readManifestRecords(oldManifestFile),
     ...readManifestRecords(manifestFile),
@@ -554,6 +569,7 @@ async function runLightMode(page, uid) {
     completed.add(item.noteId);
     completed.add(item.noteId.slice(0, 8));
   });
+  attempted.filter(item => typeof item === 'string').forEach(item => completed.add(item));
 
   log('Light mode: visible batch discovery + page-context detail/image fetch');
   log(`Light batch size: ${LIGHT_BATCH_SIZE}; max notes: ${MAX_NOTES}; scroll rounds: ${LIGHT_UNTIL_END ? 'until end' : LIGHT_SCROLL_ROUNDS}`);
@@ -561,9 +577,11 @@ async function runLightMode(page, uid) {
 
   let processed = 0;
   let total = 0;
+  let image403Total = 0;
   const kindCounts = new Map();
   let scrollRounds = 0;
   let noNewRounds = 0;
+  let atBottomRounds = 0;
   const maxScrollRounds = LIGHT_UNTIL_END ? Infinity : LIGHT_SCROLL_ROUNDS;
 
   while (processed < MAX_NOTES) {
@@ -608,8 +626,10 @@ async function runLightMode(page, uid) {
             completed.add(nid.slice(0, 8));
             writeJson(attemptedFile, [...completed].filter(n => n.length === 8));
             total += rec.images;
+            image403Total += rec.image403 || 0;
             log(`  → ${rec.images} images, ${rec.kind} (total: ${total})`);
           } else {
+            image403Total += rec.image403 || 0;
             log(`  → failed: ${rec.kind || 'unknown'}: ${rec.error || 'unknown error'} (will retry if visible again)`);
           }
 
@@ -624,15 +644,23 @@ async function runLightMode(page, uid) {
     }
 
     const posBeforeScroll = await pagePosition(page);
-    if (processed >= MAX_NOTES || scrollRounds >= maxScrollRounds || posBeforeScroll.atBottom) break;
-    if (noNewRounds >= 3) {
-      log('No new notes for 3 consecutive viewports; stopping to avoid an idle loop.');
+    if (processed >= MAX_NOTES || scrollRounds >= maxScrollRounds) break;
+    if (posBeforeScroll.atBottom) {
+      atBottomRounds++;
+      if (atBottomRounds >= 2) break;
+      log('At bottom once; waiting for lazy-loaded cards before stopping.');
+      await settleAfterLightScroll(page);
+      continue;
+    }
+    atBottomRounds = 0;
+    if (noNewRounds >= 5) {
+      log('No new notes for 5 consecutive viewports; stopping to avoid an idle loop.');
       break;
     }
 
     await scrollOneViewport(page);
     scrollRounds++;
-    await sleep(rand(3000, 6000));
+    await settleAfterLightScroll(page);
 
     if (LIGHT_REST_EVERY > 0 && scrollRounds % LIGHT_REST_EVERY === 0 && processed < MAX_NOTES) {
       const restMs = rand(LIGHT_REST_MIN_MS, LIGHT_REST_MAX_MS);
@@ -645,6 +673,7 @@ async function runLightMode(page, uid) {
   if (kindCounts.size > 0) {
     log(`Light result kinds: ${[...kindCounts.entries()].map(([kind, count]) => `${kind}=${count}`).join(', ')}`);
   }
+  if (image403Total > 0) log(`Image HTTP 403 failures in this run: ${image403Total}`);
   const all = fs.readdirSync(OUTPUT_DIR).filter(f => /^[0-9a-f]+_\d+\.webp$/.test(f));
   log(`Directory now has ${all.length} images across ${new Set(all.map(f => f.split('_')[0])).size} note prefixes.`);
   return total;
@@ -664,10 +693,10 @@ async function downloadNote(page, noteId, xsec, uid, outputDir) {
   await sleep(2000);
   if (page.url().includes('error') || page.url().includes('404')) return 0;
 
-  // 风控检测：撞到验证/频繁提示就停（实测 XHS 会显示 "安全验证" / "请勿频繁操作" / "访问频繁"）
+  // 风控检测：撞到强信号频繁访问提示就停。
   const blocked = await page.evaluate(() => {
     const t = ((document.body && document.body.innerText) || '').slice(0, 300);
-    if (/安全验证|安全限制|请勿频繁操作|操作过于频繁|访问异常|访问频繁|请稍后再试/.test(t)) return true;
+    if (/安全限制|请勿频繁操作|操作过于频繁|访问异常|访问频繁|请稍后再试/.test(t)) return true;
     if (/error_code=300013/.test(window.location.href)) return true;
     return false;
   });
