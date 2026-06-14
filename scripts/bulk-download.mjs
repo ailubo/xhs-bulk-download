@@ -334,21 +334,11 @@ async function patientScroll(page) {
 async function extractXsec(page) {
   return await page.evaluate(() => {
     const m = {};
-    document.querySelectorAll('section.note-item').forEach(item => {
-      // 新XHS: noteId 已不在 href 中，改为从封面图 URL 提取
-      const coverImg = item.querySelector('img[src*="xhscdn.com"]');
-      if (!coverImg) return;
-      const src = coverImg.getAttribute('src') || '';
-      // URL格式: .../YYYYMMDDHHmmss/NOTEID.../notes_uhdr/... 取前24位
-      const nidMatch = src.match(/\/([a-f0-9]{24,})\//);
-      if (!nidMatch) return;
-      const noteId = nidMatch[1].slice(0, 24);
-      // 从链接提取xsec
-      const link = item.querySelector('a[href*="xsec_token="]');
-      if (!link) return;
-      const h = link.getAttribute('href') || '';
-      const xsecMatch = h.match(/xsec_token=([^&]+)/);
-      if (xsecMatch) m[noteId] = xsecMatch[1];
+    document.querySelectorAll('section.note-item a[href*="/user/profile/"]').forEach(a => {
+      const h = a.getAttribute('href');
+      if (!h) return;
+      const x = h.match(/\/user\/profile\/[^/]+\/([a-f0-9]{24})\?xsec_token=([^&]+)&/);
+      if (x) m[x[1]] = x[2];
     });
     return m;
   });
@@ -357,22 +347,12 @@ async function extractXsec(page) {
 async function extractVisibleXsec(page) {
   return await page.evaluate(() => {
     const m = {};
-    document.querySelectorAll('section.note-item').forEach(item => {
-      const rect = item.getBoundingClientRect();
+    document.querySelectorAll('section.note-item a[href*="/user/profile/"]').forEach(a => {
+      const rect = a.getBoundingClientRect();
       if (rect.width < 20 || rect.height < 20 || rect.bottom < 0 || rect.top > window.innerHeight) return;
-      // 从封面图 URL 提取 noteId
-      const coverImg = item.querySelector('img[src*="xhscdn.com"]');
-      if (!coverImg) return;
-      const src = coverImg.getAttribute('src') || '';
-      const nidMatch = src.match(/\/([a-f0-9]{24,})\//);
-      if (!nidMatch) return;
-      const noteId = nidMatch[1].slice(0, 24);
-      // 从链接提取 xsec
-      const link = item.querySelector('a[href*="xsec_token="]');
-      if (!link) return;
-      const h = link.getAttribute('href') || '';
-      const xsecMatch = h.match(/xsec_token=([^&]+)/);
-      if (xsecMatch) m[noteId] = xsecMatch[1];
+      const h = a.getAttribute('href') || a.href || '';
+      const x = h.match(/\/user\/profile\/[^/]+\/([a-f0-9]{24})\?xsec_token=([^&]+)&/);
+      if (x) m[x[1]] = x[2];
     });
     return m;
   });
@@ -381,9 +361,7 @@ async function extractVisibleXsec(page) {
 async function scrollOneViewport(page) {
   return await page.evaluate(() => {
     const before = window.scrollY;
-    // Scroll near bottom to trigger XHS lazy loading (was 0.82, now deeper)
-    const delta = Math.floor(document.documentElement.scrollHeight - window.scrollY - window.innerHeight * 1.2);
-    if (delta <= 0) return { before, afterTarget: before, height: document.documentElement.scrollHeight, innerHeight: window.innerHeight };
+    const delta = Math.floor(window.innerHeight * 0.82);
     window.scrollBy(0, delta);
     return {
       before,
@@ -424,7 +402,6 @@ function pickImageUrl(image) {
 async function fetchDetailStateInPage(page, noteUrl, noteId) {
   return await page.evaluate(async ({ url, noteId }) => {
     const result = { ok: false, status: 0, url, note: null, error: '', riskText: false };
-    const riskRe = /300013|安全限制|访问频繁|访问异常|操作过于频繁|请勿频繁操作|请稍后再试/i;
     try {
       const res = await fetch(url, {
         credentials: 'include',
@@ -432,8 +409,11 @@ async function fetchDetailStateInPage(page, noteUrl, noteId) {
       });
       result.status = res.status;
       result.url = res.url || url;
+      // Only flag risk based on URL redirect patterns (not body text — notes may contain 安全 etc)
+      const redirected = /\/website-login\/(error|captcha)/i.test(result.url);
+      const errorCode = /error_code=30001[3-9]/.test(result.url);
+      result.riskText = redirected || errorCode;
       const html = await res.text();
-      result.riskText = riskRe.test(html) || /error_code=300013/i.test(result.url);
       if (!res.ok) {
         result.error = `detail HTTP ${res.status}`;
         return result;
@@ -449,7 +429,17 @@ async function fetchDetailStateInPage(page, noteUrl, noteId) {
         .find(text => /window\.__INITIAL_STATE__\s*=/.test(text));
       const match = stateScript?.match(/window\.__INITIAL_STATE__\s*=\s*(.*)$/s);
       if (!match) {
-        result.error = 'initial state script not found';
+        // Fallback: extract image URLs directly from HTML (XHS no longer embeds __INITIAL_STATE__)
+        const cdnUrls = [...html.matchAll(/sns-webpic-qc\.xhscdn\.com\/([^"'\s]+)(?:!nd)?/g)];
+        if (cdnUrls.length > 0) {
+          result.ok = true;
+          result.note = {
+            title: (doc.title || '').replace(' - 小红书', '').trim(),
+            imageList: cdnUrls.map(m => ({ urlDefault: 'https://' + m[0] })),
+          };
+          return result;
+        }
+        result.error = 'initial state script not found and no CDN images in HTML';
         return result;
       }
       let state;
@@ -596,111 +586,83 @@ async function runLightMode(page, uid) {
   });
   attempted.filter(item => typeof item === 'string').forEach(item => completed.add(item));
 
-  log('Light mode: visible batch discovery + page-context detail/image fetch');
-  log(`Light batch size: ${LIGHT_BATCH_SIZE}; max notes: ${MAX_NOTES}; scroll rounds: ${LIGHT_UNTIL_END ? 'until end' : LIGHT_SCROLL_ROUNDS}`);
-  log(`Rest policy: every ${LIGHT_REST_EVERY || 'never'} scrolls, ${Math.round(LIGHT_REST_MIN_MS / 1000)}-${Math.round(LIGHT_REST_MAX_MS / 1000)}s`);
-
-  let processed = 0;
-  let total = 0;
-  let image403Total = 0;
-  const kindCounts = new Map();
-  let scrollRounds = 0;
-  let noNewRounds = 0;
-  let atBottomRounds = 0;
-  const maxScrollRounds = LIGHT_UNTIL_END ? Infinity : LIGHT_SCROLL_ROUNDS;
-
-  while (processed < MAX_NOTES) {
-    const riskState = await page.evaluate(() => ({
-      text: ((document.body && document.body.innerText) || '').slice(0, 800),
-      url: window.location.href,
-    })).catch(() => ({ text: '', url: page.url() }));
-    if (isRiskText(riskState.text, riskState.url)) {
-      log('⚠️ 发现风控/验证提示，轻量模式停止。建议休息后再继续，已下载内容会断点跳过。');
-      break;
-    }
-
-    const visibleMap = await extractVisibleXsec(page);
-    Object.assign(xsecMap, visibleMap);
+  // ── 第一步：滚到底，获取全量笔记列表 ──
+  log('Step 1: Discovery — scrolling to bottom for full note list...');
+  if (Object.keys(xsecMap).length === 0) {
+    const discovered = await patientScroll(page);
+    Object.assign(xsecMap, discovered);
     writeJson(xsecCacheFile, xsecMap);
+  }
+  const allEntries = Object.entries(xsecMap);
+  const pendingEntries = allEntries.filter(([nid]) => !completed.has(nid) && !completed.has(nid.slice(0, 8)));
+  const totalNotes = allEntries.length;
+  const newCount = pendingEntries.length;
+  log(`Total notes: ${totalNotes}, already done: ${totalNotes - newCount}, new to download: ${newCount}`);
 
-    const candidates = Object.entries(visibleMap)
-      .filter(([nid]) => !completed.has(nid) && !completed.has(nid.slice(0, 8)));
-    if (candidates.length > 0) {
-      const pending = candidates.slice(0, MAX_NOTES - processed);
-      log(`Visible candidates: ${candidates.length}; downloading up to ${pending.length} before next scroll`);
-      noNewRounds = 0;
+  if (newCount === 0) {
+    log('All notes already downloaded. Nothing to do.');
+    return 0;
+  }
 
-      while (pending.length > 0 && processed < MAX_NOTES) {
-        const batch = pending.splice(0, LIGHT_BATCH_SIZE);
-        for (let i = 0; i < batch.length; i++) {
-          const [nid, xsec] = batch[i];
-          log(`[light ${processed + 1}/${MAX_NOTES}] ${nid.slice(0, 8)}`);
-          const rec = await downloadNoteLight(page, nid, xsec, uid, OUTPUT_DIR);
-          processed++;
-          kindCounts.set(rec.kind || 'unknown', (kindCounts.get(rec.kind || 'unknown') || 0) + 1);
+  // ── 第二步：逐批下载（不滚动） ──
+  const toProcess = pendingEntries.slice(0, MAX_NOTES);
+  log(`Step 2: Download — processing up to ${toProcess.length} new notes in batches of ${LIGHT_BATCH_SIZE}`);
+  log(`Rest: ${Math.round(LIGHT_REST_MIN_MS/1000)}-${Math.round(LIGHT_REST_MAX_MS/1000)}s between batches`);
 
-          appendManifestRecord(manifestFile, rec);
+  let processed = 0, total = 0, image403Total = 0;
+  const kindCounts = new Map();
 
-          if (rec.risk) {
-            log('⚠️ 页面内详情请求返回风控内容，轻量模式停止。');
-            return total;
-          }
+  for (let i = 0; i < toProcess.length; i += LIGHT_BATCH_SIZE) {
+    const batch = toProcess.slice(i, i + LIGHT_BATCH_SIZE);
+    for (let j = 0; j < batch.length; j++) {
+      const [nid, xsec] = batch[j];
+      const globalIdx = processed + 1;
+      log(`[${globalIdx}/${toProcess.length}] ${nid.slice(0, 8)}`);
+      const rec = await downloadNoteLight(page, nid, xsec, uid, OUTPUT_DIR);
+      processed++;
+      kindCounts.set(rec.kind || 'unknown', (kindCounts.get(rec.kind || 'unknown') || 0) + 1);
+      appendManifestRecord(manifestFile, rec);
 
-          if (rec.ok) {
-            completed.add(nid);
-            completed.add(nid.slice(0, 8));
-            writeJson(attemptedFile, [...completed].filter(n => n.length === 8));
-            total += rec.images;
-            image403Total += rec.image403 || 0;
-            log(`  → ${rec.images} images, ${rec.kind} (total: ${total})`);
-          } else {
-            image403Total += rec.image403 || 0;
-            log(`  → failed: ${rec.kind || 'unknown'}: ${rec.error || 'unknown error'} (will retry if visible again)`);
-          }
-
-          if ((i < batch.length - 1 || pending.length > 0) && processed < MAX_NOTES) {
-            await sleep(rand(4000, 9000));
-          }
-        }
+      if (rec.risk) {
+        completed.add(nid);
+        completed.add(nid.slice(0, 8));
+        writeJson(attemptedFile, [...completed].filter(n => n.length === 8));
+        log(`  → skipped: risk text in content (false positive)`);
+        continue;
       }
-    } else {
-      log('No new visible notes in current viewport.');
-      noNewRounds++;
+
+      if (rec.ok) {
+        completed.add(nid);
+        completed.add(nid.slice(0, 8));
+        writeJson(attemptedFile, [...completed].filter(n => n.length === 8));
+        total += rec.images;
+        image403Total += rec.image403 || 0;
+        log(`  → ${rec.images} images, ${rec.kind} (total: ${total})`);
+      } else {
+        image403Total += rec.image403 || 0;
+        log(`  → failed: ${rec.kind || 'unknown'}: ${rec.error || 'unknown error'}`);
+      }
+
+      if (j < batch.length - 1) {
+        await sleep(rand(4000, 9000));
+      }
     }
 
-    const posBeforeScroll = await pagePosition(page);
-    if (processed >= MAX_NOTES || scrollRounds >= maxScrollRounds) break;
-    if (posBeforeScroll.atBottom) {
-      atBottomRounds++;
-      if (atBottomRounds >= 2) break;
-      log('At bottom once; waiting for lazy-loaded cards before stopping.');
-      await settleAfterLightScroll(page);
-      continue;
-    }
-    atBottomRounds = 0;
-    if (noNewRounds >= 5) {
-      log('No new notes for 5 consecutive viewports; stopping to avoid an idle loop.');
-      break;
-    }
-
-    await scrollOneViewport(page);
-    scrollRounds++;
-    await settleAfterLightScroll(page);
-
-    if (LIGHT_REST_EVERY > 0 && scrollRounds % LIGHT_REST_EVERY === 0 && processed < MAX_NOTES) {
+    // 批次间休息（防风控）
+    if (i + LIGHT_BATCH_SIZE < toProcess.length) {
       const restMs = rand(LIGHT_REST_MIN_MS, LIGHT_REST_MAX_MS);
-      log(`  🍵 ${scrollRounds} scrolls completed, resting ${Math.round(restMs / 1000)}s...`);
+      log(`  🍵 Batch done, resting ${Math.round(restMs / 1000)}s...`);
       await sleep(restMs);
     }
   }
 
-  log(`\nLight mode done! Downloaded ${total} images in this run.`);
+  log(`\nDone! Downloaded ${total} images in this run.`);
   if (kindCounts.size > 0) {
-    log(`Light result kinds: ${[...kindCounts.entries()].map(([kind, count]) => `${kind}=${count}`).join(', ')}`);
+    log(`Result kinds: ${[...kindCounts.entries()].map(([k,c]) => `${k}=${c}`).join(', ')}`);
   }
-  if (image403Total > 0) log(`Image HTTP 403 failures in this run: ${image403Total}`);
+  if (image403Total > 0) log(`Image HTTP 403: ${image403Total}`);
   const all = fs.readdirSync(OUTPUT_DIR).filter(f => /^[0-9a-f]+_\d+\.webp$/.test(f));
-  log(`Directory now has ${all.length} images across ${new Set(all.map(f => f.split('_')[0])).size} note prefixes.`);
+  log(`Directory: ${all.length} images across ${new Set(all.map(f => f.split('_')[0])).size} note prefixes.`);
   return total;
 }
 
