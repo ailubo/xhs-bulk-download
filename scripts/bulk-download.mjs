@@ -1,8 +1,11 @@
 #!/usr/bin/env node
-// XHS Bulk Image Downloader v2.3 — Universal skill for any XHS blogger
+// XHS Bulk Image Downloader v2.4 — light mode only
 // Usage: node bulk-download.mjs <profile_url> <output_dir> [--chrome PATH] [--profile DIR] [--skip-login] [--max-notes N]
 //
-// v2.3 通用化改进（2026-06-07）：
+// v2.4 (2026-06-14)：
+//   - light 模式改为唯一默认模式
+//   - 内置 xhslink.com 短链自动解析
+//   - 默认 --max-notes 从 50 上调到 80
 //   - xsec 缓存：滚动结果存 .xhs-xsec-cache.json，下次跳过滚动直接下载
 //   - 已尝试追踪：.xhs-attempted.json 记录已尝试笔记（含纯文字），避免重复浪费请求
 //   - 滚动中检测风控：300013 / 访问频繁等立即停止
@@ -28,7 +31,7 @@ let CHROME_PATH = null;
 let USER_DATA_DIR = null;
 let SKIP_LOGIN = false;
 let MAX_NOTES = 80;  // 默认每次最多 80 篇，避免触发风控
-let DOWNLOAD_MODE = 'normal';
+let DOWNLOAD_MODE = 'light';
 let LIGHT_BATCH_SIZE = 8;
 let LIGHT_SCROLL_ROUNDS = 30;
 let LIGHT_UNTIL_END = false;
@@ -61,7 +64,7 @@ if (LIGHT_UNTIL_END && !MAX_NOTES_SPECIFIED) {
 }
 
 if (!PROFILE_URL || !OUTPUT_DIR) {
-  console.error('Usage: node bulk-download.mjs <profile_url> <output_dir> [--chrome PATH] [--profile DIR] [--skip-login] [--mode normal|light]');
+  console.error('Usage: node bulk-download.mjs <profile_url> <output_dir> [--chrome PATH] [--profile DIR] [--skip-login] [--max-notes N]');
   console.error('Example: node bulk-download.mjs "https://xhslink.com/m/xxxxx" "./xhs_output" --skip-login');
   process.exit(1);
 }
