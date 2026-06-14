@@ -27,7 +27,7 @@ let OUTPUT_DIR = null;
 let CHROME_PATH = null;
 let USER_DATA_DIR = null;
 let SKIP_LOGIN = false;
-let MAX_NOTES = 50;  // 默认每次最多 50 篇，避免触发风控
+let MAX_NOTES = 80;  // 默认每次最多 80 篇，避免触发风控
 let DOWNLOAD_MODE = 'normal';
 let LIGHT_BATCH_SIZE = 8;
 let LIGHT_SCROLL_ROUNDS = 30;
@@ -753,6 +753,41 @@ async function main() {
   log(`Mode:        ${DOWNLOAD_MODE}`);
 
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+
+  // Resolve xhslink.com short links to full profile URL
+  if (PROFILE_URL.includes('xhslink.com')) {
+    log('Resolving xhslink.com short link...');
+    const resolveLaunchArgs = [
+      '--no-sandbox', '--disable-setuid-sandbox',
+      '--disable-blink-features=AutomationControlled', '--no-first-run',
+    ];
+    const resolveBrowser = await puppeteer.launch({
+      executablePath: CHROME_PATH,
+      userDataDir: USER_DATA_DIR,
+      headless: false,
+      args: resolveLaunchArgs,
+      ignoreDefaultArgs: ['--enable-automation'],
+    });
+    try {
+      const resolvePage = await resolveBrowser.newPage();
+      await resolvePage.goto(PROFILE_URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      await sleep(3000);
+      const resolvedUrl = await resolvePage.evaluate(() => window.location.href);
+      if (resolvedUrl) {
+        const resolvedUid = resolvedUrl.match(/profile\/([a-f0-9]{24})/);
+        if (resolvedUid) {
+          PROFILE_URL = resolvedUrl;
+          log(`Resolved: ${PROFILE_URL.substring(0, 80)}...`);
+        }
+      }
+    } finally {
+      await resolveBrowser.close();
+    }
+    if (PROFILE_URL.includes('xhslink.com')) {
+      log('ERROR: Failed to resolve xhslink.com short link');
+      process.exit(1);
+    }
+  }
 
   // Extract user ID from URL
   const uidMatch = PROFILE_URL.match(/profile\/([a-f0-9]{24})/);
