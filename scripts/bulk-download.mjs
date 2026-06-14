@@ -334,11 +334,21 @@ async function patientScroll(page) {
 async function extractXsec(page) {
   return await page.evaluate(() => {
     const m = {};
-    document.querySelectorAll('section.note-item a').forEach(a => {
-      const h = a.getAttribute('href');
-      if (!h) return;
-      const x = h.match(/\/user\/profile\/[^/]+\/([a-f0-9]{24})\?xsec_token=([^&]+)&/);
-      if (x) m[x[1]] = x[2];
+    document.querySelectorAll('section.note-item').forEach(item => {
+      // 新XHS: noteId 已不在 href 中，改为从封面图 URL 提取
+      const coverImg = item.querySelector('img[src*="xhscdn.com"]');
+      if (!coverImg) return;
+      const src = coverImg.getAttribute('src') || '';
+      // URL格式: .../YYYYMMDDHHmmss/NOTEID.../notes_uhdr/... 取前24位
+      const nidMatch = src.match(/\/([a-f0-9]{24,})\//);
+      if (!nidMatch) return;
+      const noteId = nidMatch[1].slice(0, 24);
+      // 从链接提取xsec
+      const link = item.querySelector('a[href*="xsec_token="]');
+      if (!link) return;
+      const h = link.getAttribute('href') || '';
+      const xsecMatch = h.match(/xsec_token=([^&]+)/);
+      if (xsecMatch) m[noteId] = xsecMatch[1];
     });
     return m;
   });
@@ -347,12 +357,22 @@ async function extractXsec(page) {
 async function extractVisibleXsec(page) {
   return await page.evaluate(() => {
     const m = {};
-    document.querySelectorAll('section.note-item a, a[href*="/user/profile/"]').forEach(a => {
-      const rect = a.getBoundingClientRect();
+    document.querySelectorAll('section.note-item').forEach(item => {
+      const rect = item.getBoundingClientRect();
       if (rect.width < 20 || rect.height < 20 || rect.bottom < 0 || rect.top > window.innerHeight) return;
-      const h = a.getAttribute('href') || a.href || '';
-      const x = h.match(/\/user\/profile\/[^/]+\/([a-f0-9]{24})\?xsec_token=([^&]+)&/);
-      if (x) m[x[1]] = x[2];
+      // 从封面图 URL 提取 noteId
+      const coverImg = item.querySelector('img[src*="xhscdn.com"]');
+      if (!coverImg) return;
+      const src = coverImg.getAttribute('src') || '';
+      const nidMatch = src.match(/\/([a-f0-9]{24,})\//);
+      if (!nidMatch) return;
+      const noteId = nidMatch[1].slice(0, 24);
+      // 从链接提取 xsec
+      const link = item.querySelector('a[href*="xsec_token="]');
+      if (!link) return;
+      const h = link.getAttribute('href') || '';
+      const xsecMatch = h.match(/xsec_token=([^&]+)/);
+      if (xsecMatch) m[noteId] = xsecMatch[1];
     });
     return m;
   });
@@ -361,7 +381,9 @@ async function extractVisibleXsec(page) {
 async function scrollOneViewport(page) {
   return await page.evaluate(() => {
     const before = window.scrollY;
-    const delta = Math.floor(window.innerHeight * 0.82);
+    // Scroll near bottom to trigger XHS lazy loading (was 0.82, now deeper)
+    const delta = Math.floor(document.documentElement.scrollHeight - window.scrollY - window.innerHeight * 1.2);
+    if (delta <= 0) return { before, afterTarget: before, height: document.documentElement.scrollHeight, innerHeight: window.innerHeight };
     window.scrollBy(0, delta);
     return {
       before,
