@@ -1,13 +1,14 @@
 {
   "name": "xhs-bulk-download",
-  "version": "2.1.0",
+  "version": "2.3.0",
   "description": "批量下载小红书博主个人主页全部笔记图片的命令行工具",
   "type": "module",
   "bin": {
     "xhs-bulk-download": "scripts/bulk-download.mjs"
   },
   "scripts": {
-    "start": "node scripts/bulk-download.mjs"
+    "start": "node scripts/bulk-download.mjs",
+    "single": "node xhs-single-note.mjs"
   },
   "engines": {
     "node": ">=18"
